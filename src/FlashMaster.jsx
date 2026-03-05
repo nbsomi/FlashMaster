@@ -28,6 +28,8 @@ import {
   LineChart, Line, CartesianGrid, AreaChart, Area, Cell,
 } from "recharts";
 
+const GOOGLE_CLIENT_ID = (import.meta.env.VITE_GOOGLE_CLIENT_ID || "").trim();
+
 // ══════════════════════════════════════════════════════════════
 // §1  DEXIE LOADER  — loads real Dexie.js from CDN at runtime
 // ══════════════════════════════════════════════════════════════
@@ -841,9 +843,7 @@ function AppProvider({ children }) {
   const [googleUser,  setGoogleUser]  = useState(() => {
     try { return JSON.parse(localStorage.getItem("fm_google_user") || "null"); } catch { return null; }
   });
-  const [googleClientId, setGoogleClientIdState] = useState(() =>
-    localStorage.getItem("fm_google_client_id") || ""
-  );
+  const googleClientId = GOOGLE_CLIENT_ID;
   const [gdriveSyncing, setGdriveSyncing] = useState(false);
   const [gdriveStatus,  setGdriveStatus]  = useState("");
   const [lastSyncedAt,  setLastSyncedAt]  = useState(() =>
@@ -1250,17 +1250,10 @@ function AppProvider({ children }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uid_, questions, userProgress, userQA, settings.dailyFlashGoal]);
 
-  // ── Google Client ID management ────────────────────────────
-  function saveGoogleClientId(id) {
-    localStorage.setItem("fm_google_client_id", id);
-    setGoogleClientIdState(id);
-    showToast("Google Client ID saved!");
-  }
-
   // ── Google Sign-In (mandatory, first screen) ───────────────
   async function googleSignIn() {
     if (!googleClientId.trim()) {
-      showToast("Enter your Google Client ID first!", "error");
+      showToast("Google OAuth is not configured", "error");
       return;
     }
     try {
@@ -1369,7 +1362,7 @@ function AppProvider({ children }) {
   // ── Google Drive: manual push (for Settings panel) ────────
   async function syncProfileToDrive() {
     if (!googleUser) { showToast("Sign in to Google first!", "error"); return; }
-    if (!googleClientId) { showToast("Missing Google Client ID", "error"); return; }
+    if (!googleClientId) { showToast("Google OAuth is not configured", "error"); return; }
     if (!uid_) { showToast("Select a profile first", "error"); return; }
     // Trigger immediately by clearing debounce timer and running now
     if (autoSyncTimer.current) clearTimeout(autoSyncTimer.current);
@@ -1409,7 +1402,7 @@ function AppProvider({ children }) {
   // ── Google Drive: Pull all profiles ───────────────────────
   async function restoreFromDrive() {
     if (!googleUser) { showToast("Sign in to Google first!", "error"); return; }
-    if (!googleClientId) { showToast("Missing Google Client ID", "error"); return; }
+    if (!googleClientId) { showToast("Google OAuth is not configured", "error"); return; }
     setGdriveSyncing(true);
     setGdriveStatus("Downloading from Drive…");
     try {
@@ -1516,7 +1509,7 @@ function AppProvider({ children }) {
     getAccuracy, getWeakLessons, selectAdaptive, getTodayDP, showToast,
     // Google / Drive
     googleUser, googleClientId, gdriveSyncing, gdriveStatus, lastSyncedAt,
-    googleSignIn, googleSignOut, saveGoogleClientId,
+    googleSignIn, googleSignOut,
     syncProfileToDrive, restoreFromDrive,
     SRS, ReviewQueue, CSV, Speech, Crypto,
   };
@@ -2747,11 +2740,10 @@ function AnalyticsScreen() {
 function SettingsScreen() {
   const { settings, saveSettings, exportBackup, importBackup, resetAllStats, navigate, pwaPrompt, currentProfile,
           googleUser, googleClientId, gdriveSyncing, gdriveStatus,
-          googleSignIn, googleSignOut, saveGoogleClientId,
+          googleSignIn, googleSignOut,
           syncProfileToDrive, restoreFromDrive } = useApp();
   const [s, setS]       = useState(settings);
   const [sec, setSec]   = useState("general");
-  const [clientIdDraft, setClientIdDraft] = useState(googleClientId);
   const toggle = k       => setS(p => ({ ...p, [k]: !p[k] }));
   const set_   = (k, v)  => setS(p => ({ ...p, [k]: v }));
 
@@ -2836,25 +2828,16 @@ function SettingsScreen() {
 
         {/* ── Cloud / Google Drive Tab ─────────────────────── */}
         {sec==="cloud" && (<>
-          {/* Step 1: Client ID */}
+          {/* Step 1: OAuth config */}
           <div style={{padding:"14px 0",borderBottom:"1px solid var(--border)"}}>
-            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Google OAuth Client ID</div>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Google OAuth Configuration</div>
             <div style={{fontSize:12,color:"var(--muted)",marginBottom:10}}>
-              Create a project at <span style={{color:"var(--primary)"}}>console.cloud.google.com</span>, enable the Drive API, create an OAuth 2.0 Web Client ID, and add your domain to the Authorized JavaScript Origins.
+              Client ID is loaded from environment and hidden from the UI.
             </div>
-            <div style={{display:"flex",gap:8}}>
-              <input
-                className="input"
-                placeholder="xxx.apps.googleusercontent.com"
-                value={clientIdDraft}
-                onChange={e=>setClientIdDraft(e.target.value)}
-                style={{flex:1,fontSize:12}}
-              />
-              <button className="btn btn-primary btn-sm" onClick={()=>saveGoogleClientId(clientIdDraft.trim())} disabled={!clientIdDraft.trim()}>
-                Save
-              </button>
-            </div>
-            {googleClientId && <div style={{fontSize:11,color:"var(--green)",marginTop:6}}>✅ Client ID saved</div>}
+            {googleClientId
+              ? <div style={{fontSize:11,color:"var(--green)",marginTop:6}}>✅ Client ID configured</div>
+              : <div style={{fontSize:11,color:"var(--red)",marginTop:6}}>❌ Missing VITE_GOOGLE_CLIENT_ID</div>
+            }
           </div>
 
           {/* Step 2: Sign In */}
@@ -2886,7 +2869,7 @@ function SettingsScreen() {
                   <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58Z" fill="#EA4335"/>
                 </svg>
                 Sign in with Google
-                {!googleClientId && <span style={{fontSize:10,color:"var(--accent)"}}>(save Client ID first)</span>}
+                {!googleClientId && <span style={{fontSize:10,color:"var(--accent)"}}>(missing env config)</span>}
               </button>
             )}
           </div>
@@ -3089,8 +3072,7 @@ function ProfilesScreen() {
 // §21b  GOOGLE LOGIN SCREEN (mandatory first screen)
 // ══════════════════════════════════════════════════════════════
 function GoogleLoginScreen() {
-  const { googleClientId, saveGoogleClientId, googleSignIn, gdriveStatus } = useApp();
-  const [clientDraft, setClientDraft] = useState(googleClientId);
+  const { googleClientId, googleSignIn, gdriveStatus } = useApp();
   const [signing, setSigning] = useState(false);
 
   async function handleSignIn() {
@@ -3140,34 +3122,8 @@ function GoogleLoginScreen() {
           </div>
         </div>
 
-        {/* Client ID input */}
-        <div style={{marginBottom:16}}>
-          <div style={{fontWeight:700,fontSize:12,color:"var(--muted)",marginBottom:6,textTransform:"uppercase",letterSpacing:.5}}>
-            Google OAuth Client ID
-          </div>
-          <div style={{display:"flex",gap:8}}>
-            <input
-              className="input"
-              placeholder="xxx.apps.googleusercontent.com"
-              value={clientDraft}
-              onChange={e=>setClientDraft(e.target.value)}
-              style={{flex:1,fontSize:12}}
-            />
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={()=>saveGoogleClientId(clientDraft.trim())}
-              disabled={!clientDraft.trim() || clientDraft.trim()===googleClientId}
-            >
-              Save
-            </button>
-          </div>
-          {googleClientId
-            ? <div style={{fontSize:11,color:"var(--green)",marginTop:5}}>✅ Client ID configured</div>
-            : <div style={{fontSize:11,color:"var(--accent)",marginTop:5}}>
-                ⚠️ Paste your Client ID from{" "}
-                <span style={{color:"var(--primary)"}}>console.cloud.google.com</span>
-              </div>
-          }
+        <div style={{fontSize:11,color:googleClientId?"var(--green)":"var(--accent)",marginBottom:16,textAlign:"center"}}>
+          {googleClientId ? "✅ Google OAuth configured" : "⚠️ Missing VITE_GOOGLE_CLIENT_ID"}
         </div>
 
         {/* Sign-in button */}
@@ -3210,7 +3166,7 @@ function GoogleLoginScreen() {
             ["3","OAuth consent screen → External → Add your email as test user"],
             ["4","Credentials → Create OAuth 2.0 Client ID → Web app"],
             ["5","Add your domain to Authorized JavaScript Origins"],
-            ["6","Paste the Client ID above, click Save, then sign in"],
+            ["6","Set VITE_GOOGLE_CLIENT_ID in your environment, then sign in"],
           ].map(([n,t])=>(
             <div key={n} style={{display:"flex",gap:10,marginBottom:8,alignItems:"flex-start"}}>
               <div style={{
