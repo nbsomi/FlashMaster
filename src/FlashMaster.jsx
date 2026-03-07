@@ -679,15 +679,71 @@ function splitPromptLines(text, maxChars = 22, maxLines = 3) {
 }
 
 const CSV = {
-  parseRow(line) {
-    const cols = []; let cur = "", inQ = false;
-    for (let i = 0; i <= line.length; i++) {
-      const c = line[i];
-      if (c === '"') { inQ = !inQ; continue; }
-      if ((c === "," || i === line.length) && !inQ) { cols.push(cur.trim()); cur = ""; }
-      else cur += c || "";
+  normalizeHeader(header = "") {
+    return String(header)
+      .replace(/^\uFEFF/, "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s-]+/g, "_");
+  },
+
+  parseTable(text) {
+    const source = String(text || "")
+      .replace(/^\uFEFF/, "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
+    const rows = [];
+    let row = [];
+    let cell = "";
+    let inQuotes = false;
+
+    const pushCell = () => {
+      row.push(cell.trim());
+      cell = "";
+    };
+    const pushRow = () => {
+      if (!row.length) return;
+      if (row.some(value => value !== "")) rows.push(row);
+      row = [];
+    };
+
+    for (let i = 0; i < source.length; i++) {
+      const ch = source[i];
+
+      if (ch === '"') {
+        if (inQuotes && source[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+        continue;
+      }
+      if (ch === "," && !inQuotes) {
+        pushCell();
+        continue;
+      }
+      if (ch === "\n" && !inQuotes) {
+        pushCell();
+        pushRow();
+        continue;
+      }
+      cell += ch;
     }
-    return cols.map(c => c.replace(/^"|"$/g, "").trim());
+
+    if (cell.length || row.length) {
+      pushCell();
+      pushRow();
+    }
+
+    return {
+      rows,
+      error: inQuotes ? "File contains an unclosed quoted field." : "",
+    };
+  },
+
+  parseRow(line) {
+    return this.parseTable(line).rows[0] || [];
   },
 
   /**
@@ -695,10 +751,11 @@ const CSV = {
    * Returns { rows, errors, warnings, preview }
    */
   parse(text) {
-    const lines = text.replace(/\r\n/g, "\n").trim().split("\n").filter(l => l.trim());
-    if (lines.length < 2) return { rows: [], errors: ["File has no data rows"], warnings: [], preview: [] };
+    const { rows: table, error: parseError } = this.parseTable(text);
+    if (parseError) return { rows: [], errors: [parseError], warnings: [], preview: [] };
+    if (table.length < 2) return { rows: [], errors: ["File has no data rows"], warnings: [], preview: [] };
 
-    const headers = this.parseRow(lines[0]).map(h => h.toLowerCase().replace(/\s+/g, "_"));
+    const headers = table[0].map(h => this.normalizeHeader(h));
     const errors = [], warnings = [];
 
     const idx = name => headers.indexOf(name);
@@ -706,7 +763,7 @@ const CSV = {
     const aCol = [idx("answer"), idx("a")].find(i => i >= 0);
     const mediaCol = idx("media");
     const answerTypeCols = headers.map((header, index) =>
-      header.startsWith("answer-") ? { key: header.slice(7), index } : null
+      header.startsWith("answer_") ? { key: header.slice(7), index } : null
     ).filter(Boolean);
 
     if (qCol === undefined && mediaCol < 0) return { rows: [], errors: ["Missing column: question_text, question, or media"], warnings: [], preview: [] };
@@ -714,16 +771,15 @@ const CSV = {
 
     const rows = [], preview = [];
 
-    lines.slice(1).forEach((line, li) => {
-      if (!line.trim()) return;
-      const c = this.parseRow(line);
-      const get = (i, fb = "") => (i !== undefined && i >= 0 ? c[i] || "" : fb).trim();
+    table.slice(1).forEach((cols, li) => {
+      if (!cols.some(value => String(value || "").trim())) return;
+      const get = (i, fb = "") => (i !== undefined && i >= 0 ? cols[i] || "" : fb).trim();
 
       const rawType = get(idx("type"));
-      const rawDiff = get(idx("difficulty")) || get(idx("diff")) || "medium";
+      const rawDiff = (get(idx("difficulty")) || get(idx("diff")) || "medium").toLowerCase();
       const media = get(mediaCol);
       const normalizedCsvType = String(rawType || "").trim().toLowerCase();
-      const type = normalizedCsvType === "image" ? "Image" : normalizedCsvType === "text" ? "Text" : (media ? "Image" : "Text");
+      const type = normalizeQuestionType(rawType || (media ? "Image" : "Text"), media);
       const diff = VALID_DIFF.includes(rawDiff) ? rawDiff : "medium";
       const answerVariants = answerTypeCols
         .map(col => {
@@ -745,7 +801,7 @@ const CSV = {
       if (!qt) { warnings.push(`Row ${li+2}: empty question — skipped`); return; }
       if (!answerVariants.length) { warnings.push(`Row ${li+2}: empty answer — skipped`); return; }
 
-      if (rawType && !["text","image"].includes(normalizedCsvType))
+      if (rawType && !["text","image","audio"].includes(normalizedCsvType))
         warnings.push(`Row ${li+2}: unknown type "${rawType}" → defaulted to ${type}`);
 
       const primaryAnswer = answerVariants[0];
@@ -2736,11 +2792,20 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
   const [filename, setFilename]= useState("");
   const [topicName, setTopic] = useState("");
   const [error, setError]     = useState("");
+  const [dragActive, setDragActive] = useState(false);
+  const fileInputRef = useRef(null);
+
+  function resetFilePicker() {
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
 
   async function handleFile(file) {
+    if (!file) return;
+    resetFilePicker();
     setFilename(file.name);
     setError("");
     setParsed(null);
+    setDragActive(false);
 
     try {
       const text = await file.text();
@@ -2750,12 +2815,30 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
         return;
       }
       setParsed(result);
-      setTopic(file.name.replace(/\.csv$/i,"").replace(/[_-]/g," ").trim());
+      setTopic(file.name.replace(/\.(csv|txt)$/i,"").replace(/[_-]/g," ").trim());
       setStep("preview");
     } catch (e) {
       console.error("CSV file read/parse failed:", e);
       setError(e?.message || String(e));
     }
+  }
+
+  function handleFileChange(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (file) handleFile(file);
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    const dropped = Array.from(e.dataTransfer?.files || []);
+    const file = dropped.find(item => /\.(csv|txt)$/i.test(item.name) || /(csv|plain)/i.test(item.type || ""));
+    if (!file) {
+      setDragActive(false);
+      setError("Please choose a .csv or .txt file.");
+      return;
+    }
+    handleFile(file);
   }
 
   async function doImport() {
@@ -2774,14 +2857,43 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
     <Modal title="Import CSV" onClose={onClose} wide>
       {step === "upload" && (
         <div>
-          <div style={{ border:"2px dashed var(--border)", borderRadius:14, padding:40, textAlign:"center", marginBottom:16 }}>
+          <div
+            onDragEnter={e => { e.preventDefault(); setDragActive(true); }}
+            onDragOver={e => {
+              e.preventDefault();
+              if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+              if (!dragActive) setDragActive(true);
+            }}
+            onDragLeave={e => {
+              e.preventDefault();
+              if (e.currentTarget.contains(e.relatedTarget)) return;
+              setDragActive(false);
+            }}
+            onDrop={handleDrop}
+            style={{
+              border:`2px dashed ${dragActive ? "var(--primary)" : "var(--border)"}`,
+              borderRadius:14,
+              padding:40,
+              textAlign:"center",
+              marginBottom:16,
+              background:dragActive ? "rgba(99,102,241,.08)" : "transparent",
+              transition:"border-color .18s ease, background .18s ease",
+            }}
+          >
             <div style={{ fontSize:48, marginBottom:12 }}>📥</div>
             <div style={{ fontWeight:700, fontSize:15, marginBottom:8 }}>Drop CSV or click to browse</div>
             <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, type, difficulty, subtopic, explanation, media, answer-{answer-type}</div>
-            <label className="btn btn-primary btn-lg" style={{ cursor:"pointer" }}>
+            <button className="btn btn-primary btn-lg" type="button" onClick={() => fileInputRef.current?.click()}>
               Choose File
-              <input type="file" accept=".csv,.txt" style={{ display:"none" }} onChange={e => e.target.files[0] && handleFile(e.target.files[0])} />
-            </label>
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.txt,text/csv,text/plain"
+              style={{ display:"none" }}
+              onChange={handleFileChange}
+            />
+            {filename && <div style={{ fontSize:12, color:"var(--muted)", marginTop:12 }}>{filename}</div>}
           </div>
           {error && <div style={{ background:"var(--red)15", border:"1px solid var(--red)40", borderRadius:10, padding:"10px 14px", color:"var(--red)", fontSize:13 }}>❌ {error}</div>}
           <div className="card" style={{ marginTop:16, padding:14 }}>
