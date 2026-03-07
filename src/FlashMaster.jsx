@@ -23,18 +23,14 @@ import {
   useState, useEffect, useContext, createContext,
   useRef, useCallback, useMemo, useReducer, Suspense,
 } from "react";
+import JSZip from "jszip";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   LineChart, Line, CartesianGrid, AreaChart, Area, Cell,
 } from "recharts";
 
 const GOOGLE_CLIENT_ID = (import.meta.env.VITE_GOOGLE_CLIENT_ID || "").trim();
-const GOOGLE_IMAGE_SEARCH_API_KEY = (import.meta.env.VITE_GOOGLE_IMAGE_SEARCH_API_KEY || "").trim();
-const GOOGLE_IMAGE_SEARCH_CX = (import.meta.env.VITE_GOOGLE_IMAGE_SEARCH_CX || "").trim();
-const GOOGLE_IMAGE_SEARCH_ENABLED = !!(GOOGLE_IMAGE_SEARCH_API_KEY && GOOGLE_IMAGE_SEARCH_CX);
 const DOCUMENTATION_URL = `${import.meta.env.BASE_URL}documentation/index.html`;
-const GOOGLE_IMAGE_CACHE = new Map();
-const GOOGLE_IMAGE_PENDING = new Map();
 
 // ══════════════════════════════════════════════════════════════
 // §1  DEXIE LOADER  — loads real Dexie.js from CDN at runtime
@@ -615,6 +611,28 @@ class ReviewQueue {
 // ══════════════════════════════════════════════════════════════
 const VALID_TYPES = ["Text","Image","MCQ","FillBlank","TrueFalse","Match","Order","Dictation","MultiSelect","Cloze","Audio"];
 const VALID_DIFF  = ["easy","medium","hard"];
+const ZIP_IMAGE_FILE_RE = /\.(avif|bmp|gif|jpe?g|png|svg|webp)$/i;
+const IMPORT_MODE_META = {
+  csv: {
+    label: "CSV + Media URLs",
+    accept: ".csv,.txt,text/csv,text/plain",
+    prompt: "Drop CSV or click to browse",
+    helper: "Image rows must include a media or media_url value.",
+  },
+  zip: {
+    label: "ZIP Images",
+    accept: ".zip,application/zip,application/x-zip-compressed",
+    prompt: "Drop ZIP or click to browse",
+    helper: "Each image becomes a question. The filename becomes the answer.",
+  },
+};
+
+function detectImportMode(file) {
+  if (!file) return "";
+  if (/\.zip$/i.test(file.name) || /zip/i.test(file.type || "")) return "zip";
+  if (/\.(csv|txt)$/i.test(file.name) || /(csv|plain)/i.test(file.type || "")) return "csv";
+  return "";
+}
 
 function normalizeQuestionType(questionOrType, media = "") {
   const rawType = typeof questionOrType === "string" ? questionOrType : questionOrType?.type;
@@ -641,6 +659,32 @@ function hashString(input = "") {
   let hash = 0;
   for (let i = 0; i < input.length; i++) hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
   return hash;
+}
+
+function readAsDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("Could not read image file"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function decodeZipLabel(value = "") {
+  const source = String(value || "");
+  try {
+    return decodeURIComponent(source);
+  } catch {
+    return source;
+  }
+}
+
+function labelFromZipSegment(value = "") {
+  return decodeZipLabel(value)
+    .replace(/\.[^.]+$/, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 const CSV = {
@@ -726,12 +770,12 @@ const CSV = {
     const idx = name => headers.indexOf(name);
     const qCol = [idx("question_text"), idx("question"), idx("q")].find(i => i >= 0);
     const aCol = [idx("answer"), idx("a")].find(i => i >= 0);
-    const mediaCol = idx("media");
+    const mediaCol = [idx("media"), idx("media_url"), idx("image_url")].find(i => i >= 0);
     const answerTypeCols = headers.map((header, index) =>
       header.startsWith("answer_") ? { key: header.slice(7), index } : null
     ).filter(Boolean);
 
-    if (qCol === undefined && mediaCol < 0) return { rows: [], errors: ["Missing column: question_text, question, or media"], warnings: [], preview: [] };
+    if (qCol === undefined && mediaCol === undefined) return { rows: [], errors: ["Missing column: question_text, question, media, or media_url"], warnings: [], preview: [] };
     if (aCol === undefined && !answerTypeCols.length) return { rows: [], errors: ["Missing column: answer or answer-{answer-type}"], warnings: [], preview: [] };
 
     const rows = [], preview = [];
@@ -761,6 +805,10 @@ const CSV = {
       const legacyAnswer = get(aCol);
       if (!answerVariants.length && legacyAnswer) {
         answerVariants.push({ key:"answer", label:"Answer", value:legacyAnswer, isDefault:true });
+      }
+      if (type === "Image" && !media) {
+        warnings.push(`Row ${li+2}: image question missing media URL — skipped`);
+        return;
       }
       const qt = get(qCol) || getMediaPrompt(type);
       if (!qt) { warnings.push(`Row ${li+2}: empty question — skipped`); return; }
@@ -799,6 +847,70 @@ const CSV = {
       (groups[key] ??= []).push(r);
     }
     return groups;
+  },
+};
+
+const ImageZip = {
+  async parse(file) {
+    if (!file) return { rows: [], errors: ["No ZIP file selected"], warnings: [], preview: [] };
+
+    let zip;
+    try {
+      zip = await JSZip.loadAsync(file);
+    } catch (error) {
+      return { rows: [], errors: ["Could not open ZIP file"], warnings: [error?.message || String(error)], preview: [] };
+    }
+
+    const entries = [];
+    zip.forEach((relativePath, entry) => {
+      if (entry.dir) return;
+      if (/^__MACOSX\//.test(relativePath)) return;
+      if (!ZIP_IMAGE_FILE_RE.test(relativePath)) return;
+      entries.push({ relativePath, entry });
+    });
+
+    if (!entries.length) {
+      return { rows: [], errors: ["ZIP contains no supported image files"], warnings: [], preview: [] };
+    }
+
+    entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+
+    const rows = [];
+    const preview = [];
+    const warnings = [];
+
+    for (const { relativePath, entry } of entries) {
+      const parts = relativePath.split("/").filter(Boolean);
+      const fileName = parts[parts.length - 1] || relativePath;
+      const answer = labelFromZipSegment(fileName);
+      if (!answer) {
+        warnings.push(`Skipped ${relativePath}: filename does not contain a usable answer`);
+        continue;
+      }
+
+      const subtopicHint = parts.length > 1 ? labelFromZipSegment(parts[parts.length - 2]) : "";
+      const media = await readAsDataUrl(await entry.async("blob"));
+      const answerVariants = [{ key:"answer", label:"Answer", value:answer, isDefault:true }];
+      const row = {
+        question_text: "Identify the picture.",
+        answer,
+        answerTypeKey: "answer",
+        answerTypeLabel: "Answer",
+        answerVariants,
+        options: "",
+        type: "Image",
+        difficulty: "medium",
+        tags: "",
+        media,
+        explanation: "",
+        subtopic_hint: subtopicHint,
+      };
+      rows.push(row);
+      if (preview.length < 5) preview.push(row);
+    }
+
+    if (!rows.length) return { rows: [], errors: ["ZIP contains no usable image questions"], warnings, preview: [] };
+    return { rows, errors: [], warnings, preview };
   },
 };
 
@@ -903,134 +1015,17 @@ function getAnswerPlaceholder(type, answerTypeLabel = "") {
   return "Type your answer...";
 }
 
-function getQuestionImageSubject(question) {
-  const basePrompt = getBaseQuestionPrompt(question);
-  const primaryAnswer = getQuestionAnswerEntries(question)[0]?.value || "";
-  const cleanedBase = basePrompt
-    .replace(/^identify (this|the)?\s*(picture|image|photo|object|item|animal|fruit|vegetable|place|monument)?\.?$/i, "")
-    .replace(/^name (this|the)?\s*(picture|image|photo|object|item|animal|fruit|vegetable|place|monument)?\.?$/i, "")
-    .replace(/^what is shown in (this|the)\s*(picture|image|photo)\??$/i, "")
-    .replace(/^look at (this|the)\s*(picture|image|photo)\.?$/i, "")
-    .trim();
-  return cleanedBase || primaryAnswer;
-}
-
-function getQuestionImageSearchQuery(question) {
-  const subject = getQuestionImageSubject(question);
-  if (!subject) return "";
-  return `${subject} reference image`;
-}
-
-const GoogleImageSearch = {
-  isConfigured() {
-    return GOOGLE_IMAGE_SEARCH_ENABLED;
-  },
-
-  async findImage(question) {
-    if (!this.isConfigured()) return "";
-    const query = getQuestionImageSearchQuery(question);
-    if (!query) return "";
-
-    const cacheKey = `${GOOGLE_IMAGE_SEARCH_CX}:${query}`;
-    if (GOOGLE_IMAGE_CACHE.has(cacheKey)) return GOOGLE_IMAGE_CACHE.get(cacheKey);
-    if (GOOGLE_IMAGE_PENDING.has(cacheKey)) return GOOGLE_IMAGE_PENDING.get(cacheKey);
-
-    const task = (async () => {
-      const params = new URLSearchParams({
-        key: GOOGLE_IMAGE_SEARCH_API_KEY,
-        cx: GOOGLE_IMAGE_SEARCH_CX,
-        q: query,
-        searchType: "image",
-        num: "5",
-        safe: "active",
-        imgSize: "large",
-      });
-      const response = await fetch(`https://www.googleapis.com/customsearch/v1?${params.toString()}`);
-      if (!response.ok) {
-        const detail = await response.text().catch(() => "");
-        throw new Error(`Google image search failed (${response.status})${detail ? `: ${detail.slice(0, 140)}` : ""}`);
-      }
-      const payload = await response.json();
-      const result = Array.isArray(payload?.items)
-        ? payload.items.find(item => typeof item?.link === "string" && /^https?:\/\//i.test(item.link))
-        : null;
-      if (!result?.link) throw new Error("Google image search returned no usable image result");
-      GOOGLE_IMAGE_CACHE.set(cacheKey, result.link);
-      return result.link;
-    })()
-      .catch(err => {
-        console.warn("[FM6] Google image search:", err.message);
-        return "";
-      })
-      .finally(() => GOOGLE_IMAGE_PENDING.delete(cacheKey));
-
-    GOOGLE_IMAGE_PENDING.set(cacheKey, task);
-    return task;
-  },
-};
-
 function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
-  const generationSeed = `${question?.id || ""}:${question?.media || ""}:${question?.baseQuestionText || question?.question_text || ""}:${question?.answer || ""}`;
-  const [src, setSrc] = useState(() => question?.media || "");
-  const [loadingFallback, setLoadingFallback] = useState(false);
-  const [loadingMessage, setLoadingMessage] = useState("");
-  const [fallbackTried, setFallbackTried] = useState(false);
-
-  const resolveFallbackImage = useCallback(async () => {
-    if (!isImageQuestion(question) || fallbackTried) return;
-    setFallbackTried(true);
-    setLoadingFallback(true);
-
-    if (GoogleImageSearch.isConfigured()) {
-      setLoadingMessage("Searching Google Images...");
-      const searched = await GoogleImageSearch.findImage(question);
-      if (searched) {
-        setSrc(searched);
-        setLoadingFallback(false);
-        setLoadingMessage("");
-        return;
-      }
-    }
-
-    setSrc("");
-    setLoadingFallback(false);
-    setLoadingMessage("");
-  }, [question, fallbackTried]);
-
-  useEffect(() => {
-    setSrc(question?.media || "");
-    setLoadingFallback(false);
-    setLoadingMessage("");
-    setFallbackTried(false);
-  }, [generationSeed, question?.media]);
-
-  useEffect(() => {
-    if (!question?.media) resolveFallbackImage();
-  }, [question?.media, resolveFallbackImage]);
-
-  if (!question?.media && !src) return null;
   if (isImageQuestion(question)) {
+    if (!question?.media) return null;
     return (
       <div style={{ width:"100%" }}>
         <img
-          src={src}
+          src={question.media}
           alt="Question prompt"
           style={{ maxWidth:"100%", maxHeight, borderRadius:10, marginBottom, objectFit:"contain", display:"block" }}
-          onError={e => {
-            e.currentTarget.style.display = "block";
-            if (!fallbackTried && GoogleImageSearch.isConfigured()) {
-              setSrc("");
-              resolveFallbackImage();
-              return;
-            }
-            e.currentTarget.style.display = "none";
-          }}
+          onError={e => { e.currentTarget.style.display = "none"; }}
         />
-        {loadingFallback && (
-          <div style={{ fontSize:11, color:"var(--muted)", marginTop:-2, marginBottom }}>
-            {loadingMessage || "Resolving image..."}
-          </div>
-        )}
       </div>
     );
   }
@@ -2622,38 +2617,64 @@ function FlashScreen() {
 // §16  CSV IMPORT PREVIEW MODAL
 // ══════════════════════════════════════════════════════════════
 function CSVImportModal({ subjectId, onClose, onImport }) {
-  const [step, setStep]       = useState("upload"); // upload | preview | importing | done
-  const [parsed, setParsed]   = useState(null);
-  const [filename, setFilename]= useState("");
+  const [step, setStep] = useState("upload");
+  const [mode, setMode] = useState("csv");
+  const [parsed, setParsed] = useState(null);
+  const [filename, setFilename] = useState("");
   const [topicName, setTopic] = useState("");
-  const [error, setError]     = useState("");
+  const [error, setError] = useState("");
   const [dragActive, setDragActive] = useState(false);
   const fileInputRef = useRef(null);
+  const modeMeta = IMPORT_MODE_META[mode];
 
   function resetFilePicker() {
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
+  function guessTopicName(fileName, importMode) {
+    const pattern = importMode === "zip" ? /\.zip$/i : /\.(csv|txt)$/i;
+    return fileName.replace(pattern, "").replace(/[_-]/g, " ").trim();
+  }
+
+  function switchMode(nextMode) {
+    if (!IMPORT_MODE_META[nextMode] || nextMode === mode) return;
+    setMode(nextMode);
+    setParsed(null);
+    setFilename("");
+    setTopic("");
+    setError("");
+    setDragActive(false);
+    setStep("upload");
+    resetFilePicker();
+  }
+
   async function handleFile(file) {
     if (!file) return;
+    const nextMode = detectImportMode(file);
+    if (!nextMode) {
+      setDragActive(false);
+      setError("Please choose a .csv, .txt, or .zip file.");
+      return;
+    }
+
     resetFilePicker();
+    if (nextMode !== mode) setMode(nextMode);
     setFilename(file.name);
     setError("");
     setParsed(null);
     setDragActive(false);
 
     try {
-      const text = await file.text();
-      const result = CSV.parse(text);
+      const result = nextMode === "zip" ? await ImageZip.parse(file) : CSV.parse(await file.text());
       if (result.errors.length) {
         setError(result.errors.join("; "));
         return;
       }
       setParsed(result);
-      setTopic(file.name.replace(/\.(csv|txt)$/i,"").replace(/[_-]/g," ").trim());
+      setTopic(guessTopicName(file.name, nextMode) || "Imported Questions");
       setStep("preview");
     } catch (e) {
-      console.error("CSV file read/parse failed:", e);
+      console.error("Question import parse failed:", e);
       setError(e?.message || String(e));
     }
   }
@@ -2667,10 +2688,10 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
   function handleDrop(e) {
     e.preventDefault();
     const dropped = Array.from(e.dataTransfer?.files || []);
-    const file = dropped.find(item => /\.(csv|txt)$/i.test(item.name) || /(csv|plain)/i.test(item.type || ""));
+    const file = dropped.find(item => !!detectImportMode(item));
     if (!file) {
       setDragActive(false);
-      setError("Please choose a .csv or .txt file.");
+      setError("Please choose a .csv, .txt, or .zip file.");
       return;
     }
     handleFile(file);
@@ -2682,16 +2703,28 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
       await onImport(subjectId, topicName, parsed.rows);
       setStep("done");
     } catch (e) {
-      console.error("CSV import failed:", e);
+      console.error("Question import failed:", e);
       setError(e?.message || String(e));
       setStep("preview");
     }
   }
 
   return (
-    <Modal title="Import CSV" onClose={onClose} wide>
+    <Modal title="Import Questions" onClose={onClose} wide>
       {step === "upload" && (
         <div>
+          <div style={{ display:"flex", gap:10, marginBottom:16, flexWrap:"wrap" }}>
+            {Object.entries(IMPORT_MODE_META).map(([key, meta]) => (
+              <button
+                key={key}
+                className={`tab-btn ${mode === key ? "active" : ""}`}
+                type="button"
+                onClick={() => switchMode(key)}
+              >
+                {meta.label}
+              </button>
+            ))}
+          </div>
           <div
             onDragEnter={e => { e.preventDefault(); setDragActive(true); }}
             onDragOver={e => {
@@ -2715,37 +2748,56 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
             }}
           >
             <div style={{ fontSize:48, marginBottom:12 }}>📥</div>
-            <div style={{ fontWeight:700, fontSize:15, marginBottom:8 }}>Drop CSV or click to browse</div>
-            <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, type, difficulty, subtopic, explanation, media, answer-{"{answer-type}"}</div>
+            <div style={{ fontWeight:700, fontSize:15, marginBottom:8 }}>{modeMeta.prompt}</div>
+            <div style={{ fontSize:12, color:"var(--muted)", marginBottom:8 }}>{modeMeta.helper}</div>
+            {mode === "csv" && <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, type, difficulty, subtopic, explanation, media, media_url, answer-{"{answer-type}"}</div>}
+            {mode === "zip" && <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Optional folders become subtopics. Example: <code>Fruits/Apple.jpg</code> imports answer <code>Apple</code> under subtopic <code>Fruits</code>.</div>}
             <button className="btn btn-primary btn-lg" type="button" onClick={() => fileInputRef.current?.click()}>
-              Choose File
+              {mode === "zip" ? "Choose ZIP" : "Choose File"}
             </button>
             <input
               ref={fileInputRef}
               type="file"
-              accept=".csv,.txt,text/csv,text/plain"
+              accept={modeMeta.accept}
               style={{ display:"none" }}
               onChange={handleFileChange}
             />
             {filename && <div style={{ fontSize:12, color:"var(--muted)", marginTop:12 }}>{filename}</div>}
           </div>
           {error && <div style={{ background:"var(--red)15", border:"1px solid var(--red)40", borderRadius:10, padding:"10px 14px", color:"var(--red)", fontSize:13 }}>❌ {error}</div>}
-          <div className="card" style={{ marginTop:16, padding:14 }}>
+          <div className="card" style={{ marginTop:16, padding:14, display: mode === "csv" ? "block" : "none" }}>
             <div style={{ fontWeight:700, fontSize:13, marginBottom:8 }}>📋 CSV Format Example</div>
             <pre style={{ fontSize:11, color:"var(--muted)", overflow:"auto", fontFamily:"monospace", lineHeight:1.8 }}>{
 `question_text,type,difficulty,subtopic,explanation,media,answer-capital,answer-currency
 India,Text,medium,Geography,Answer one requested field,,New Delhi,Rupee
-Identify this fruit,Image,easy,Objects,Missing media will generate a fallback image,,Apple,
 Identify this monument,Image,medium,Landmarks,Uses the supplied image,https://example.com/taj-mahal.jpg,Taj Mahal,`
             }</pre>
           </div>
+          {mode === "zip" && (
+            <div className="card" style={{ marginTop:16, padding:14 }}>
+              <div style={{ fontWeight:700, fontSize:13, marginBottom:8 }}>ZIP Import Example</div>
+              <pre style={{ fontSize:11, color:"var(--muted)", overflow:"auto", fontFamily:"monospace", lineHeight:1.8 }}>{
+`animals/
+  tiger.jpg
+  polar-bear.png
+flags/
+  india.png
+
+Results:
+- tiger.jpg -> answer "tiger"
+- polar-bear.png -> answer "polar bear"
+- india.png -> answer "india"
+- animals / flags become subtopics`
+              }</pre>
+            </div>
+          )}
         </div>
       )}
 
       {step === "preview" && parsed && (
         <div>
           <div style={{ display:"flex", gap:10, marginBottom:14, flexWrap:"wrap" }}>
-            <div className="card" style={{ flex:1, padding:"10px 14px", textAlign:"center" }}><div style={{ fontFamily:"var(--syne)", fontWeight:800, fontSize:22, color:"var(--green)" }}>{parsed.rows.length}</div><div style={{ fontSize:11, color:"var(--muted)" }}>Valid Rows</div></div>
+            <div className="card" style={{ flex:1, padding:"10px 14px", textAlign:"center" }}><div style={{ fontFamily:"var(--syne)", fontWeight:800, fontSize:22, color:"var(--green)" }}>{parsed.rows.length}</div><div style={{ fontSize:11, color:"var(--muted)" }}>Questions</div></div>
             <div className="card" style={{ flex:1, padding:"10px 14px", textAlign:"center" }}><div style={{ fontFamily:"var(--syne)", fontWeight:800, fontSize:22, color:"var(--accent)" }}>{parsed.warnings.length}</div><div style={{ fontSize:11, color:"var(--muted)" }}>Warnings</div></div>
             <div className="card" style={{ flex:1, padding:"10px 14px", textAlign:"center" }}><div style={{ fontFamily:"var(--syne)", fontWeight:800, fontSize:22, color:"var(--primary)" }}>{Object.keys(CSV.groupBySubtopic(parsed.rows, topicName)).length}</div><div style={{ fontSize:11, color:"var(--muted)" }}>Subtopics</div></div>
           </div>
@@ -2759,7 +2811,7 @@ Identify this monument,Image,medium,Landmarks,Uses the supplied image,https://ex
             </div>
           )}
           <div className="card" style={{ marginBottom:14, padding:14 }}>
-            <div style={{ fontWeight:700, fontSize:13, marginBottom:10 }}>Preview (first 5 rows)</div>
+            <div style={{ fontWeight:700, fontSize:13, marginBottom:10 }}>Preview (first 5 questions)</div>
             {parsed.preview.map((r, i) => (
               <div key={i} style={{ padding:"8px 0", borderBottom:"1px solid var(--border)", fontSize:13 }}>
                 <div style={{ display:"flex", gap:6, marginBottom:4 }}>
@@ -3283,21 +3335,6 @@ function SettingsScreen() {
             }
           </div>
 
-          <div style={{padding:"14px 0",borderBottom:"1px solid var(--border)"}}>
-            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Google Image Search</div>
-            <div style={{fontSize:12,color:"var(--muted)",marginBottom:10}}>
-              Missing image questions use Google Programmable Search image results when no image URL is supplied in the data.
-            </div>
-            {GOOGLE_IMAGE_SEARCH_ENABLED ? (
-              <div style={{fontSize:11,color:"var(--green)",marginBottom:6}}>Configured</div>
-            ) : (
-              <div style={{fontSize:11,color:"var(--red)",marginBottom:6}}>Missing VITE_GOOGLE_IMAGE_SEARCH_API_KEY or VITE_GOOGLE_IMAGE_SEARCH_CX</div>
-            )}
-            <div style={{fontSize:11,color:"var(--accent)",marginTop:8,lineHeight:1.5}}>
-              Use a browser-restricted API key. This uses the official Google image search API, not brittle HTML scraping.
-            </div>
-          </div>
-
           {/* Step 2: Sign In */}
           <div style={{padding:"14px 0",borderBottom:"1px solid var(--border)"}}>
             <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Google Account</div>
@@ -3624,8 +3661,8 @@ function SubjectsScreen() {
       setLog(`✅ "${r.topicName}" · ${r.subtopicCount} subtopics · ${r.questionCount} questions`);
       setTimeout(()=>setLog(""),8000);
     } catch (e) {
-      console.error("CSV import failed:", e);
-      showToast(`CSV import failed: ${e?.message||e}`, "error");
+      console.error("Question import failed:", e);
+      showToast(`Import failed: ${e?.message||e}`, "error");
     }
   }
 
@@ -3636,7 +3673,7 @@ function SubjectsScreen() {
         <button className="btn btn-primary" onClick={()=>setModal(true)}>+ Subject</button>
       </div>
       {log&&<div style={{marginBottom:12,padding:"10px 14px",background:"var(--green)12",border:"1px solid var(--green)30",borderRadius:10,fontSize:13,color:"var(--green)",fontWeight:700}}>{log}</div>}
-      {!subjects.length?<Empty icon="📚" title="No subjects yet" sub="Create one, then import CSV questions" action={<button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Add Subject</button>}/>:subjects.map(s=>(
+      {!subjects.length?<Empty icon="📚" title="No subjects yet" sub="Create one, then import questions" action={<button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Add Subject</button>}/>:subjects.map(s=>(
         <div key={s.id} className="card" style={{marginBottom:12,padding:"16px 20px"}}>
           <div style={{display:"flex",alignItems:"center",gap:14}}>
             <div style={{fontSize:30}}>📗</div>
@@ -3645,7 +3682,7 @@ function SubjectsScreen() {
               <div style={{fontSize:12,color:"var(--muted)"}}>{s.language||"English"}</div>
             </div>
             <div style={{display:"flex",gap:6}}>
-              <button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation();setCSVSubId(s.id);}} title="Import CSV">📥</button>
+              <button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation();setCSVSubId(s.id);}} title="Import Questions">📥</button>
               <button className="btn btn-ghost btn-sm" onClick={()=>navigate("topics",{subjectId:s.id})}>›</button>
               <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm(`Delete "${s.name}"?`))deleteSubject(s.id);}}>🗑</button>
             </div>
@@ -3672,7 +3709,7 @@ function TopicsScreen() {
         <div className="h1">📖 Topics</div>
         <button className="btn btn-primary" onClick={()=>setModal(true)}>+ Topic</button>
       </div>
-      {!myT.length?<Empty icon="📖" title="No topics" sub="Create a topic or import a CSV to auto-create" action={<button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Topic</button>}/>:myT.map(t=>{
+      {!myT.length?<Empty icon="📖" title="No topics" sub="Create a topic or import questions to auto-create" action={<button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Topic</button>}/>:myT.map(t=>{
         const stids=subtopics.filter(s=>s.tid===t.id).map(s=>s.id);
         const qs=questions.filter(q=>stids.includes(q.stid));
         const textCount=qs.filter(q=>!isImageQuestion(q)).length;
@@ -3713,7 +3750,7 @@ function SubtopicsScreen() {
         <div className="h1">{topic?.name||"Subtopics"}</div>
         <button className="btn btn-primary" onClick={()=>setModal(true)}>+ Subtopic</button>
       </div>
-      {!myST.length?<Empty icon="📑" title="No subtopics" sub="Create or import CSV" action={<button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Subtopic</button>}/>:myST.map(st=>{
+      {!myST.length?<Empty icon="📑" title="No subtopics" sub="Create or import questions" action={<button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Subtopic</button>}/>:myST.map(st=>{
         const qs=questions.filter(q=>q.stid===st.id);
         const progs=qs.map(q=>progMap.get(q.id)).filter(Boolean);
         const mastered=progs.filter(p=>p.status==="mastered").length;
@@ -3758,9 +3795,9 @@ function QuestionsScreen() {
     <div>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
         <div className="h1">{st?.name||"Questions"}</div>
-        <button className="btn btn-ghost" onClick={()=>navigate("subjects")}>Import CSV</button>
+        <button className="btn btn-ghost" onClick={()=>navigate("subjects")}>Import Questions</button>
       </div>
-      {!myQs.length?<Empty icon="❓" title="No questions" sub="Questions are loaded from CSV imports only" action={<button className="btn btn-primary btn-lg" onClick={()=>navigate("subjects")}>Go To Subjects</button>}/>:( 
+      {!myQs.length?<Empty icon="❓" title="No questions" sub="Questions are loaded from CSV or ZIP image imports" action={<button className="btn btn-primary btn-lg" onClick={()=>navigate("subjects")}>Go To Subjects</button>}/>:( 
         useVirtual?(
           <VirtualList items={myQs} itemHeight={92} containerHeight={520} renderItem={(q)=>{
             const label=getQuestionLabel(q);

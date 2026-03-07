@@ -29,7 +29,7 @@
           <h1>Technical documentation for the current FlashMaster repository.</h1>
           <p class="lead">
             This page documents the code that is currently in the repo: runtime structure, screen map, IndexedDB schema,
-            CSV import behavior, Google Drive sync, environment configuration, and practical maintenance notes.
+            CSV and ZIP import behavior, Google Drive sync, environment configuration, and practical maintenance notes.
             Most application logic lives in <code>src/FlashMaster.jsx</code>.
           </p>
           <div class="chips">
@@ -38,7 +38,7 @@
             <span class="chip">Dexie + IndexedDB</span>
             <span class="chip">Google OAuth + Drive</span>
             <span class="chip">SM-2 review engine</span>
-            <span class="chip">CSV-first content import</span>
+            <span class="chip">CSV + ZIP content import</span>
           </div>
         </div>
         <div class="card">
@@ -49,7 +49,7 @@
             <li>Auth model: Google sign-in is required by default</li>
             <li>Auto-sync debounce: 4 seconds</li>
             <li>Primary storage: IndexedDB via Dexie</li>
-            <li>Question management: CSV imports only in the current UI</li>
+            <li>Question management: CSV and ZIP image imports in the current UI</li>
           </ul>
         </div>
       </div>
@@ -64,7 +64,7 @@
           <li><a href="#data">Data model</a></li>
           <li><a href="#screens">Screen map</a></li>
           <li><a href="#content">Content model</a></li>
-          <li><a href="#csv">CSV import</a></li>
+          <li><a href="#csv">Import workflow</a></li>
           <li><a href="#sync">Sync and backup</a></li>
           <li><a href="#config">Configuration</a></li>
           <li><a href="#workflow">Developer workflow</a></li>
@@ -88,7 +88,7 @@
                 <li>Flash study using SM-2 style scheduling</li>
                 <li>Quiz sessions with adaptive selection and timers</li>
                 <li>Analytics driven by review history and quiz attempts</li>
-                <li>CSV import with preview and validation</li>
+                <li>CSV and ZIP import with preview and validation</li>
                 <li>Google Drive backup / restore</li>
                 <li>Speech synthesis and speech recognition helpers</li>
               </ul>
@@ -98,8 +98,8 @@
               <ul>
                 <li>The app uses state-based screen navigation, not route-based navigation.</li>
                 <li>Google login is the default access gate.</li>
-                <li>Question content is loaded from CSV imports in the current UI flow.</li>
-                <li>Missing image media can use Google image search if configured; there is no SVG or AI fallback now.</li>
+                <li>Question content is loaded from CSV imports and ZIP image imports in the current UI flow.</li>
+                <li>Image questions require explicit media. There is no Google image search, SVG placeholder, or AI fallback.</li>
               </ul>
             </div>
           </div>
@@ -136,6 +136,7 @@
             <div class="card">
               <ul>
                 <li><strong>CSV</strong>: parse, validate, preview, and import grouping.</li>
+                <li><strong>ImageZip</strong>: unzip local image packs, derive answers from filenames, and group by folders.</li>
                 <li><strong>Speech</strong>: TTS and pronunciation helpers.</li>
                 <li><strong>Crypto</strong>: encrypted backup support.</li>
                 <li><strong>AppProvider</strong>: central state owner for the whole app.</li>
@@ -237,24 +238,24 @@
             <div class="card">
               <h3>Media model</h3>
               <ul>
-                <li><code>media</code> can be an image or audio URL</li>
-                <li>Missing image media can trigger Google image search if configured</li>
-                <li>No local placeholder image or AI image generation remains in the current build</li>
+                <li><code>media</code> can be an image or audio URL, including ZIP-imported data URLs</li>
+                <li>Image questions require explicit media from CSV or ZIP import</li>
+                <li>No search-based, placeholder, or AI image generation remains in the current build</li>
               </ul>
             </div>
           </div>
           <div class="callout info">
-            <strong>Authoring note:</strong> the renderer supports interactive types, but the current CSV importer does
-            not parse an <code>options</code> column. In practice, CSV import is best for prompt-and-answer style content,
-            plus image or audio prompts and labeled answer variants.
+            <strong>Authoring note:</strong> the renderer supports interactive types, but the current importers do not parse
+            an <code>options</code> column. In practice, CSV import is best for prompt-and-answer style content plus image
+            or audio prompts, while ZIP import is best for filename-driven image decks.
           </div>
         </section>
 
         <section id="csv">
-          <h2>6. CSV import</h2>
+          <h2>6. Import workflow</h2>
           <p class="lead">
-            CSV import follows a parse -&gt; validate -&gt; preview -&gt; import flow. The parser handles BOM-prefixed files,
-            quoted commas, escaped quotes, and multiline cells. The importer can auto-create topics and subtopics.
+            The import modal supports two paths: CSV with explicit media URLs, and ZIP image packs that derive answers
+            from filenames. Both follow a parse -&gt; validate -&gt; preview -&gt; import flow and can auto-create topics and subtopics.
           </p>
           <div class="table">
             <table>
@@ -269,15 +270,20 @@
                 <tr><td><code>difficulty</code> / <code>diff</code></td><td><code>easy</code>, <code>medium</code>, or <code>hard</code>.</td></tr>
                 <tr><td><code>subtopic</code> / <code>subtopic_hint</code></td><td>Subtopic grouping name.</td></tr>
                 <tr><td><code>explanation</code> / <code>explain</code></td><td>Explanation text for study and quiz views.</td></tr>
-                <tr><td><code>media</code></td><td>Image or audio URL.</td></tr>
+                <tr><td><code>media</code> / <code>media_url</code></td><td>Image or audio URL. Required for CSV image rows.</td></tr>
                 <tr><td><code>tags</code></td><td>Stored metadata.</td></tr>
               </tbody>
             </table>
           </div>
           <pre>question_text,type,difficulty,subtopic,explanation,media,answer-capital,answer-currency
 India,Text,medium,Geography,Answer one requested field,,New Delhi,Rupee
-Identify this fruit,Image,easy,Objects,Image URL optional if Google image search is configured,,Apple,
+Identify this monument,Image,medium,Landmarks,Uses the supplied image,https://example.com/taj-mahal.jpg,Taj Mahal,
 Identify this anthem,Audio,medium,Culture,Listen and answer,https://example.com/audio.mp3,National Anthem,</pre>
+          <div class="callout info">
+            <strong>ZIP image import:</strong> each image file becomes one Image question, the filename becomes the answer,
+            and optional folders become subtopics. Example: <code>animals/tiger.jpg</code> imports answer <code>tiger</code>
+            under subtopic <code>animals</code>.
+          </div>
         </section>
 
         <section id="sync">
@@ -312,15 +318,12 @@ Identify this anthem,Audio,medium,Culture,Listen and answer,https://example.com/
         <section id="config">
           <h2>8. Configuration</h2>
           <p class="lead">
-            Google OAuth is required for the normal access path. Google image search is optional and only affects
-            image questions that do not already have a <code>media</code> URL.
+            Google OAuth is required for the normal access path. Image import does not require any separate search API keys.
           </p>
-          <pre>VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id
-VITE_GOOGLE_IMAGE_SEARCH_API_KEY=your_google_custom_search_api_key
-VITE_GOOGLE_IMAGE_SEARCH_CX=your_google_programmable_search_engine_id</pre>
+          <pre>VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id</pre>
           <div class="callout warn">
             <strong>Repository note:</strong> the checked-in <code>.env</code> file may still contain comments from
-            older image-generation experiments, but the current runtime code reads the Google variables shown here.
+            older image-generation experiments, but the current runtime code only requires the Google OAuth client ID shown here.
           </div>
         </section>
 
@@ -342,6 +345,7 @@ npm run preview</pre>
           <ul>
             <li>Verify Google sign-in.</li>
             <li>Import a CSV into a subject and confirm topic / subtopic creation.</li>
+            <li>Import a ZIP of images and confirm filenames become answers and folders become subtopics.</li>
             <li>Run one flash session and one quiz attempt.</li>
             <li>Export and re-import a local backup.</li>
             <li>Trigger Drive sync and confirm profile files exist remotely.</li>
@@ -364,7 +368,7 @@ npm run preview</pre>
               <ul>
                 <li><code>src/FlashMaster.jsx</code> mixes UI, persistence, algorithms, and integrations.</li>
                 <li>A future refactor would naturally split storage, sync, renderers, and screens.</li>
-                <li>Documentation should be updated when schema versions, CSV format, or sync payload shape changes.</li>
+                <li>Documentation should be updated when schema versions, import format, or sync payload shape changes.</li>
               </ul>
             </div>
           </div>
