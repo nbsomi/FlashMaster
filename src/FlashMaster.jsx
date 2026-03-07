@@ -97,7 +97,7 @@ const GDrive = {
           resolve(resp.access_token);
         },
       });
-      tc.requestAccessToken({ prompt: interactive ? "consent" : "" });
+      tc.requestAccessToken({ prompt: interactive ? "consent" : "none" });
     });
   },
 
@@ -462,6 +462,30 @@ const DB = {
 // ══════════════════════════════════════════════════════════════
 // §3  SM-2 ENGINE  — Full algorithm with all required fields
 // ══════════════════════════════════════════════════════════════
+function buildProfileSyncData(data, profileId) {
+  const subjects = data.subjects.filter(subject => subject.uid === profileId);
+  const subjectIds = new Set(subjects.map(subject => subject.id));
+  const topics = data.topics.filter(topic => subjectIds.has(topic.sid));
+  const topicIds = new Set(topics.map(topic => topic.id));
+  const subtopics = data.subtopics.filter(subtopic => topicIds.has(subtopic.tid));
+  const subtopicIds = new Set(subtopics.map(subtopic => subtopic.id));
+
+  return {
+    version: 6,
+    syncedAt: new Date().toISOString(),
+    syncVersion: "v6.0",
+    profiles: data.profiles.filter(profile => profile.id === profileId),
+    subjects,
+    topics,
+    subtopics,
+    questions: data.questions.filter(question => subtopicIds.has(question.stid)),
+    flashProgress: data.flashProgress.filter(progress => progress.uid === profileId),
+    quizAttempts: data.quizAttempts.filter(attempt => attempt.uid === profileId),
+    studySessions: data.studySessions ? data.studySessions.filter(session => session.uid === profileId) : [],
+    reviewHistory: data.reviewHistory.filter(review => review.uid === profileId),
+  };
+}
+
 const SRS = {
   // Maps user-facing rating → SM-2 quality score (0–5)
   QUALITY: { again: 0, hard: 2, good: 4, easy: 5 },
@@ -1141,15 +1165,54 @@ function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
 // §6  SPEECH ENGINE  — with WebKit fallback + pronunciation scoring
 // ══════════════════════════════════════════════════════════════
 const Speech = {
+  _speakTimer: null,
+
+  _normalizeSpeakText(text) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    if (!value) return "";
+    return value.includes(" ") ? value : `${value}.`;
+  },
+
+  _pickVoice(lang) {
+    if (!window.speechSynthesis?.getVoices) return null;
+    const voices = window.speechSynthesis.getVoices() || [];
+    if (!voices.length) return null;
+
+    const exact = voices.find(voice => voice.lang === lang);
+    if (exact) return exact;
+
+    const base = lang.split("-")[0]?.toLowerCase();
+    return voices.find(voice => voice.lang?.toLowerCase().startsWith(base)) || null;
+  },
+
   speak(text, lang = "en-US", rate = 1, onEnd = null) {
     if (!window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = lang; u.rate = rate;
-    if (onEnd) u.onend = onEnd;
-    window.speechSynthesis.speak(u);
+    const spokenText = this._normalizeSpeakText(text);
+    if (!spokenText) { onEnd?.(); return; }
+
+    this.cancel();
+    window.speechSynthesis.getVoices?.();
+
+    this._speakTimer = window.setTimeout(() => {
+      const u = new SpeechSynthesisUtterance(spokenText);
+      const voice = this._pickVoice(lang);
+      u.lang = lang;
+      u.rate = rate;
+      if (voice) u.voice = voice;
+      u.onend = () => onEnd?.();
+      u.onerror = () => onEnd?.();
+      window.speechSynthesis.speak(u);
+      window.speechSynthesis.resume?.();
+      this._speakTimer = null;
+    }, 90);
   },
-  cancel() { window.speechSynthesis?.cancel(); },
+  cancel() {
+    if (this._speakTimer) {
+      clearTimeout(this._speakTimer);
+      this._speakTimer = null;
+    }
+    window.speechSynthesis?.cancel();
+  },
 
   listen(onResult, onEnd, lang = "en-US") {
     // Use webkit fallback if standard API unavailable
@@ -1294,6 +1357,7 @@ function AppProvider({ children }) {
   const googleClientId = GOOGLE_CLIENT_ID;
   const [gdriveSyncing, setGdriveSyncing] = useState(false);
   const [gdriveStatus,  setGdriveStatus]  = useState("");
+  const [googleAuthChecking, setGoogleAuthChecking] = useState(false);
   const [lastSyncedAt,  setLastSyncedAt]  = useState(() =>
     localStorage.getItem("fm_last_synced") || ""
   );
@@ -1312,12 +1376,7 @@ function AppProvider({ children }) {
     catch { return { date: null, flash: 0, quiz: 0 }; }
   });
   const [currentProfile, setCP]   = useState(null);
-  const [screen,          setScreen]  = useState(() => {
-    try {
-      const cached = JSON.parse(localStorage.getItem("fm_google_user") || "null");
-      return cached ? "profiles" : "google_login";
-    } catch { return "google_login"; }
-  });
+  const [screen,          setScreen]  = useState("google_login");
   const [nav,             setNav]     = useState({});
   const [toast,           setToast]   = useState(null);
   const [focusMode,       setFocusMode]= useState(false);
@@ -1698,61 +1757,104 @@ function AppProvider({ children }) {
   }, [uid_, questions, userProgress, userQA, settings.dailyFlashGoal]);
 
   // ── Google Sign-In (mandatory, first screen) ───────────────
+  const reloadCloudData = useCallback(async () => {
+    const db = await getDB();
+    const [p, allS, allT, allST, allQ, allFP, allQA, allLB, allRH] = await Promise.all([
+      db.profiles.toArray(), db.subjects.toArray(), db.topics.toArray(),
+      db.subtopics.toArray(), db.questions.toArray(), db.flashProgress.toArray(),
+      db.quizAttempts.toArray(), db.leaderboard.toArray(), db.reviewHistory.toArray(),
+    ]);
+    setProfiles(p); setSubjects(allS); setTopics(allT); setSubtopics(allST);
+    setQuestions(allQ); setFlashProg(allFP); setQA(allQA); setLB(allLB); setRH(allRH);
+  }, []);
+
+  const restoreDriveProfiles = useCallback(async (statusMessage = "Downloading your profiles from Drive…") => {
+    setGdriveStatus(statusMessage);
+    const results = await GDrive.syncAllDown(googleClientId);
+    if (!results.length) return 0;
+
+    for (const { data } of results) {
+      if (data?.profiles?.length) await DB.importAll(data);
+    }
+    await reloadCloudData();
+    return results.length;
+  }, [googleClientId, reloadCloudData]);
+
+  const completeGoogleSession = useCallback(async (token, options = {}) => {
+    const { restoreProfiles = true } = options;
+    const userInfo = await GDrive.getUserInfo(token);
+    const user = {
+      id      : userInfo.id,
+      email   : userInfo.email,
+      name    : userInfo.name,
+      picture : userInfo.picture,
+    };
+    setGoogleUser(user);
+    localStorage.setItem("fm_google_user", JSON.stringify(user));
+
+    if (restoreProfiles) {
+      try {
+        await restoreDriveProfiles();
+      } catch (e) {
+        console.warn("[FM6] Drive pull on login:", e.message);
+      }
+    }
+
+    setGdriveStatus("");
+    setScreen("profiles");
+    return user;
+  }, [restoreDriveProfiles]);
+
+  const checkGoogleSignInStatus = useCallback(async () => {
+    if (!googleClientId.trim()) return false;
+
+    setGoogleAuthChecking(true);
+    try {
+      setGdriveStatus("Checking Google sign-in…");
+      const token = await GDrive.requestToken(googleClientId, false);
+      await completeGoogleSession(token);
+      return true;
+    } catch (e) {
+      console.warn("[FM6] Silent Google session check failed:", e.message);
+      GDrive.revokeToken();
+      setGoogleUser(null);
+      localStorage.removeItem("fm_google_user");
+      setGdriveStatus("");
+      setScreen("google_login");
+      return false;
+    } finally {
+      setGoogleAuthChecking(false);
+    }
+  }, [completeGoogleSession, googleClientId]);
+
   async function googleSignIn() {
     if (!googleClientId.trim()) {
       showToast("Google OAuth is not configured", "error");
       return;
     }
+    setGoogleAuthChecking(true);
     try {
       setGdriveStatus("Signing in…");
-      const token    = await GDrive.requestToken(googleClientId, true);
-      const userInfo = await GDrive.getUserInfo(token);
-      const user = {
-        id      : userInfo.id,
-        email   : userInfo.email,
-        name    : userInfo.name,
-        picture : userInfo.picture,
-      };
-      setGoogleUser(user);
-      localStorage.setItem("fm_google_user", JSON.stringify(user));
-
-      // Immediately pull profiles from Drive before navigating
-      setGdriveStatus("Downloading your profiles from Drive…");
-      try {
-        const results = await GDrive.syncAllDown(googleClientId);
-        if (results.length) {
-          for (const { data } of results) {
-            if (data?.profiles?.length) await DB.importAll(data);
-          }
-          const db = await getDB();
-          const [p, allS, allT, allST, allQ, allFP, allQA, allLB, allRH] = await Promise.all([
-            db.profiles.toArray(), db.subjects.toArray(), db.topics.toArray(),
-            db.subtopics.toArray(), db.questions.toArray(), db.flashProgress.toArray(),
-            db.quizAttempts.toArray(), db.leaderboard.toArray(), db.reviewHistory.toArray(),
-          ]);
-          setProfiles(p); setSubjects(allS); setTopics(allT); setSubtopics(allST);
-          setQuestions(allQ); setFlashProg(allFP); setQA(allQA); setLB(allLB); setRH(allRH);
-        }
-      } catch (e) {
-        console.warn("[FM6] Drive pull on login:", e.message);
-      }
-
-      setGdriveStatus("");
-      setScreen("profiles");
+      const token = await GDrive.requestToken(googleClientId, true);
+      const user = await completeGoogleSession(token);
       showToast(`Welcome, ${user.name}! ✅`);
       return user;
     } catch (e) {
       console.error("[FM6] Google sign-in error:", e);
       setGdriveStatus("");
       showToast("Google sign-in failed: " + e.message, "error");
+    } finally {
+      setGoogleAuthChecking(false);
     }
   }
 
   function googleSignOut(silent = false) {
     GDrive.revokeToken();
     setGoogleUser(null);
+    setGoogleAuthChecking(false);
     localStorage.removeItem("fm_google_user");
     setCP(null);
+    setGdriveStatus("");
     setScreen("google_login");
     if (!silent) showToast("Signed out");
   }
@@ -1771,23 +1873,7 @@ function AppProvider({ children }) {
       try {
         setGdriveStatus("⏳ Syncing…");
         const data = await DB.exportAll();
-        const sids = data.subjects.filter(s => s.uid === uid_).map(s => s.id);
-        const tids = data.topics.filter(t => sids.includes(t.sid)).map(t => t.id);
-        const stids = data.subtopics.filter(s => tids.includes(s.tid)).map(s => s.id);
-        const profileData = {
-          version: 6,
-          syncedAt: new Date().toISOString(),
-          syncVersion: "v6.0",
-          profiles:     data.profiles.filter(p => p.id === uid_),
-          subjects:     data.subjects.filter(s => s.uid === uid_),
-          topics:       data.topics.filter(t => sids.includes(t.sid)),
-          subtopics:    data.subtopics.filter(s => stids.includes(s.tid)),
-          questions:    data.questions.filter(q => stids.includes(q.stid)),
-          flashProgress: data.flashProgress.filter(f => f.uid === uid_),
-          quizAttempts:  data.quizAttempts.filter(a => a.uid === uid_),
-          studySessions: data.studySessions ? data.studySessions.filter(s => s.uid === uid_) : [],
-          reviewHistory: data.reviewHistory.filter(r => r.uid === uid_),
-        };
+        const profileData = buildProfileSyncData(data, uid_);
         await GDrive.syncProfileUp(googleClientId, uid_, profileData);
         const ts = new Date().toLocaleTimeString();
         setGdriveStatus(`✅ Synced at ${ts}`);
@@ -1819,21 +1905,7 @@ function AppProvider({ children }) {
     setGdriveStatus("Syncing…");
     try {
       const data = await DB.exportAll();
-      const sids = data.subjects.filter(s => s.uid === uid_).map(s => s.id);
-      const tids = data.topics.filter(t => sids.includes(t.sid)).map(t => t.id);
-      const stids = data.subtopics.filter(s => tids.includes(s.tid)).map(s => s.id);
-      const profileData = {
-        version: 6, syncedAt: new Date().toISOString(), syncVersion: "v6.0",
-        profiles:     data.profiles.filter(p => p.id === uid_),
-        subjects:     data.subjects.filter(s => s.uid === uid_),
-        topics:       data.topics.filter(t => sids.includes(t.sid)),
-        subtopics:    data.subtopics.filter(s => stids.includes(s.tid)),
-        questions:    data.questions.filter(q => stids.includes(q.stid)),
-        flashProgress: data.flashProgress.filter(f => f.uid === uid_),
-        quizAttempts:  data.quizAttempts.filter(a => a.uid === uid_),
-        studySessions: data.studySessions ? data.studySessions.filter(s => s.uid === uid_) : [],
-        reviewHistory: data.reviewHistory.filter(r => r.uid === uid_),
-      };
+      const profileData = buildProfileSyncData(data, uid_);
       await GDrive.syncProfileUp(googleClientId, uid_, profileData);
       const ts = new Date().toLocaleTimeString();
       setGdriveStatus(`✅ Synced at ${ts}`);
@@ -1957,8 +2029,8 @@ function AppProvider({ children }) {
     saveQuizAttempt, saveSettings, resetAllStats, exportBackup, importBackup,
     getAccuracy, getWeakLessons, selectAdaptive, getTodayDP, showToast,
     // Google / Drive
-    googleUser, googleClientId, gdriveSyncing, gdriveStatus, lastSyncedAt,
-    googleSignIn, googleSignOut, googleSwitchAccount,
+    googleUser, googleClientId, googleAuthChecking, gdriveSyncing, gdriveStatus, lastSyncedAt,
+    googleSignIn, googleSignOut, googleSwitchAccount, checkGoogleSignInStatus,
     syncProfileToDrive, restoreFromDrive,
     SRS, ReviewQueue, CSV, Speech, Crypto,
   };
@@ -3711,8 +3783,13 @@ function ProfilesScreen() {
 // §21b  GOOGLE LOGIN SCREEN (mandatory first screen)
 // ══════════════════════════════════════════════════════════════
 function GoogleLoginScreen() {
-  const { googleClientId, googleSignIn } = useApp();
+  const { googleClientId, googleSignIn, googleAuthChecking, checkGoogleSignInStatus } = useApp();
   const [signing, setSigning] = useState(false);
+  const busy = signing || googleAuthChecking;
+
+  useEffect(() => {
+    checkGoogleSignInStatus();
+  }, [checkGoogleSignInStatus]);
 
   async function handleSignIn() {
     setSigning(true);
@@ -3754,17 +3831,22 @@ function GoogleLoginScreen() {
         <div style={{fontSize:14,color:"var(--muted)",lineHeight:1.55,marginBottom:22}}>
           Use your Google account to access Flash Master.
         </div>
+        {googleAuthChecking && !signing && (
+          <div style={{fontSize:12,color:"var(--muted)",marginBottom:14}}>
+            Checking whether your Google sign-in is still active...
+          </div>
+        )}
 
         <button
           className="btn btn-primary btn-lg"
           style={{width:"100%",gap:12,fontSize:15}}
           onClick={handleSignIn}
-          disabled={!googleClientId || signing}
+          disabled={!googleClientId || busy}
         >
-          {signing ? (
+          {busy ? (
             <span style={{display:"flex",alignItems:"center",gap:8}}>
               <span style={{display:"inline-block",width:16,height:16,border:"2px solid rgba(255,255,255,.3)",borderTopColor:"white",borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>
-              Signing in...
+              {signing ? "Signing in..." : "Checking sign-in..."}
             </span>
           ) : (
             <><GoogleLogo /> Sign in with Google</>
