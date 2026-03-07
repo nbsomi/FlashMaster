@@ -1305,51 +1305,60 @@ const Speech = {
   speak(text, lang = "en-US", rate = 1, onEnd = null) {
     if (!window.speechSynthesis) return;
     const synth = window.speechSynthesis;
-    const wasBusy = synth.speaking || synth.pending || synth.paused;
     const spokenText = this._normalizeSpeakText(text);
     if (!spokenText) { onEnd?.(); return; }
 
-    this.cancel();
-    synth.getVoices?.();
+    // ── Stop everything in-flight (single cancel, one seq bump) ──────────
+    if (this._speakTimer) { clearTimeout(this._speakTimer); this._speakTimer = null; }
+    this._speakSeq += 1;
+    const seq = this._speakSeq;
+    synth.cancel();                    // clear browser queue exactly once
 
-    const seq = ++this._speakSeq;
-    const queue = (fn, delay = 0) => {
+    const queue = (fn, delay) => {
       this._speakTimer = window.setTimeout(() => {
         this._speakTimer = null;
         if (seq !== this._speakSeq) return;
         fn();
       }, delay);
     };
+
     const speakMain = () => {
+      if (seq !== this._speakSeq) return;
       const u = this._buildUtterance(spokenText, lang, rate, 1);
       u.onend = () => { if (seq === this._speakSeq) onEnd?.(); };
-      u.onerror = () => { if (seq === this._speakSeq) onEnd?.(); };
+      // Filter "interrupted" — fired when cancel() is called mid-speech.
+      // We must NOT invoke onEnd for an interrupted utterance; the next
+      // speak() call has already taken over.
+      u.onerror = e => { if (e?.error !== "interrupted" && seq === this._speakSeq) onEnd?.(); };
       synth.speak(u);
       synth.resume?.();
     };
+
+    // ── Warm-up primer ────────────────────────────────────────────────────
+    // iOS/Safari clips the first word because the audio session is not yet
+    // open when speech starts.  A near-silent utterance of the actual phoneme
+    // "a" forces the session open.  Volume 0.01 is required: volume 0 causes
+    // WebKit to skip the utterance entirely without firing onend/onerror.
+    // "." and other punctuation-only strings have no phonetic content and are
+    // silently dropped by many engines without firing any events.
+    // 200 ms post-primer gap is the minimum reliable pipeline warm-up time.
     const primeAndSpeak = () => {
-      // Volume must be > 0 (even if near-zero) so Safari/WebKit reliably fires onend.
-      // 150 ms post-primer gap lets the audio pipeline fully warm up before the
-      // real utterance starts — prevents the first word being clipped.
-      const primer = this._buildUtterance(".", lang, Math.max(rate, 1), 0.01);
-      primer.onend   = () => queue(speakMain, 150);
-      primer.onerror = () => queue(speakMain, 150);
+      if (seq !== this._speakSeq) return;
+      const primer = this._buildUtterance("a", lang, 1, 0.01);
+      primer.onend   = () => queue(speakMain, 200);
+      primer.onerror = () => queue(speakMain, 200);
       synth.speak(primer);
       synth.resume?.();
     };
 
-    if (wasBusy) {
-      synth.cancel();
-      queue(primeAndSpeak, 140);
-      return;
-    }
-    queue(primeAndSpeak, 50);
+    // Always wait 150 ms after cancel() so the browser fully clears its queue
+    // before we enqueue the primer.  This covers both the "was busy" and
+    // "was idle" cases with a single unified code path.
+    queue(primeAndSpeak, 150);
   },
+
   cancel() {
-    if (this._speakTimer) {
-      clearTimeout(this._speakTimer);
-      this._speakTimer = null;
-    }
+    if (this._speakTimer) { clearTimeout(this._speakTimer); this._speakTimer = null; }
     this._speakSeq += 1;
     window.speechSynthesis?.cancel();
   },
