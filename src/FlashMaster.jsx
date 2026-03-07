@@ -494,6 +494,7 @@ const DB = {
       db.flashProgress.bulkPut(data.flashProgress || []),
       db.quizAttempts.bulkPut(data.quizAttempts || []),
       db.studySessions.bulkPut(data.studySessions || []),
+      db.leaderboard.bulkPut(data.leaderboard || []),
       db.reviewHistory.bulkPut(data.reviewHistory || []),
     ]);
   },
@@ -1559,20 +1560,17 @@ function AppProvider({ children }) {
   useEffect(() => {
     (async () => {
       try {
-        await getDB(); // triggers Dexie open + migration
-        const [p, s, t, st, q, fp, qa, lb, rh] = await Promise.all([
-          DB.profiles(), DB.subjectsByUser("__all__").catch(() => []),
-          DB.topicsBySid("__all__").catch(() => []),
-          DB.subtopicsByTid("__all__").catch(() => []),
-          DB.allQuestions(), DB.progressByUser("__all__").catch(() => []),
-          DB.quizAttemptsByUser("__all__").catch(() => []),
-          DB.allLeaderboard(), DB.reviewsByUser("__all__").catch(() => []),
-        ]);
-        // Load ALL subjects/topics/subtopics/progress (filter in memory for active profile)
-        const db = await getDB();
-        const [allSubjects, allTopics, allSubtopics, allProgress, allQA, allRH] = await Promise.all([
-          db.subjects.toArray(), db.topics.toArray(), db.subtopics.toArray(),
-          db.flashProgress.toArray(), db.quizAttempts.toArray(), db.reviewHistory.toArray(),
+        const db = await getDB(); // triggers Dexie open + migration
+        const [p, allSubjects, allTopics, allSubtopics, q, allProgress, allQA, lb, allRH] = await Promise.all([
+          db.profiles.toArray(),
+          db.subjects.toArray(),
+          db.topics.toArray(),
+          db.subtopics.toArray(),
+          db.questions.toArray(),
+          db.flashProgress.toArray(),
+          db.quizAttempts.toArray(),
+          db.leaderboard.toArray(),
+          db.reviewHistory.toArray(),
         ]);
         setProfiles(p); setSubjects(allSubjects); setTopics(allTopics);
         setSubtopics(allSubtopics); setQuestions(q); setFlashProg(allProgress);
@@ -1647,9 +1645,10 @@ function AppProvider({ children }) {
   async function deleteProfile(id) {
     await DB.clearUserData(id);
     await DB.deleteProfile(id);
+    const deletedSubjectIds = subjects.filter(s => s.uid === id).map(s => s.id);
     setProfiles(prev => prev.filter(p => p.id !== id));
     setSubjects(prev => prev.filter(s => s.uid !== id));
-    setTopics(prev => prev.filter(t => !subjects.filter(s => s.uid === id).map(s => s.id).includes(t.sid)));
+    setTopics(prev => prev.filter(t => !deletedSubjectIds.includes(t.sid)));
     setFlashProg(prev => prev.filter(f => f.uid !== id));
     setQA(prev => prev.filter(a => a.uid !== id));
     setRH(prev => prev.filter(r => r.uid !== id));
@@ -2150,6 +2149,7 @@ function AppProvider({ children }) {
     if (autoSyncTimer.current) clearTimeout(autoSyncTimer.current);
     autoSyncTimer.current = setTimeout(async () => {
       try {
+        setGdriveSyncing(true);
         setGdriveStatus("⏳ Syncing…");
         const data = await DB.exportAll();
         const profileData = buildProfileSyncData(data, uid_);
@@ -2161,6 +2161,8 @@ function AppProvider({ children }) {
       } catch (e) {
         console.warn("[FM6] Auto-sync failed:", e.message);
         setGdriveStatus("⚠️ Sync failed – will retry");
+      } finally {
+        setGdriveSyncing(false);
       }
     }, 4000);
     return () => clearTimeout(autoSyncTimer.current);
@@ -2467,7 +2469,7 @@ function OrderQuestion({ question, onAnswer, checked }) {
   const [order, setOrder]     = useState(() => shuffle((question.options || question.answer || "").split(",").map(s => s.trim()).filter(Boolean)));
   const [dragging, setDragging] = useState(null);
   const [dragOver, setDragOver] = useState(null);
-  useEffect(() => { onAnswer(order.join(",")); }, [order]);
+  useEffect(() => { onAnswer(order.join(",")); }, [order, onAnswer]);
 
   function drop(ti) {
     if (dragging === null || checked) return;
@@ -2883,14 +2885,14 @@ function FlashScreen() {
       }
     }, 10_000);
     return () => clearInterval(t);
-  }, [idx, sessionStats, rep]);
+  }, [idx, sessionStats, rep, saveSessionDraft]);
 
   // TTS
   useEffect(() => {
     if (!studyCurrent || !settings.autoTTS || isDone) return;
     const t = setTimeout(() => Speech.speak(reverseMode ? studyCurrent.answer : questionPrompt, settings.ttsLang, settings.ttsRate), 300);
     return () => { clearTimeout(t); Speech.cancel(); };
-  }, [idx, reverseMode, rep]);
+  }, [idx, reverseMode, rep, settings.autoTTS]);
 
   // Keyboard
   useEffect(() => {
@@ -2907,11 +2909,12 @@ function FlashScreen() {
         if (e.code === "Digit2") rate("hard");
         if (e.code === "Digit3") rate("good");
         if (e.code === "Digit4") rate("easy");
+        // (keyboard handler correctly calls rate with string literals)
       }
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [flipped, checked, idx]);
+  }, [flipped, checked, idx, skip, markDifficult]);
 
   function skip() {
     if (isDone || !current) return;
@@ -2928,15 +2931,15 @@ function FlashScreen() {
     showToast(wasMarked ? "Mark removed" : "Marked as difficult ⚑", "info");
   }
 
-  async function rate(r) {
+  async function rate(rating) {
     const responseMs = performance.now() - cardStartRef.current;
-    await applyRating(current.id, r, Math.round(responseMs));
-    setSS(s => ({ ...s, [r]: s[r] + 1 }));
+    await applyRating(current.id, rating, Math.round(responseMs));
+    setSS(s => ({ ...s, [rating]: s[rating] + 1 }));
     Speech.cancel();
     const nextIdx = idx + 1;
     if (nextIdx >= deck.length) {
       if (rep < totalReps) {
-        setRep(r => r + 1);
+        setRep(prev => prev + 1);
         setDeck(SRS.prioritize(rawQs, progMap));
         setIdx(0);
       } else { setIdx(nextIdx); }
@@ -2946,6 +2949,7 @@ function FlashScreen() {
 
   function reset() {
     setFlipped(false); setUserAnswer(""); setChecked(false);
+    setIsCorrect(null);
     setShowHint(false); setShowRepeat(false);
     cardStartRef.current = performance.now();
   }
@@ -3102,7 +3106,7 @@ function FlashScreen() {
       textAlign: "center",
       fontWeight: 700,
       marginBottom: 10,
-      color: isCorrect ? "green" : "red"
+      color: isCorrect ? "var(--green)" : "var(--red)"
   }}>
     {isCorrect ? "✓ Correct" : `✗ Correct answer: ${studyCurrent.answer}`}
   </div>
@@ -3406,7 +3410,7 @@ function QuizScreen() {
   const current = qList[qi];
 
   useEffect(() => { setUa(""); setChk(false); setTL(settings.timerSec || 30); }, [qi]);
-  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak(getQuestionLabel(current), settings.ttsLang, settings.ttsRate); }, [qi]);
+  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak(getQuestionLabel(current), settings.ttsLang, settings.ttsRate); }, [qi, settings.autoTTS]);
 
   useEffect(() => {
     if (!settings.timerSec || checked || done || !current) return;
@@ -3842,7 +3846,7 @@ function SettingsScreen() {
           <Row label="Import Backup"><label className="btn btn-ghost btn-sm" style={{cursor:"pointer"}}>📥 Import<input type="file" accept=".json" style={{display:"none"}} onChange={async e=>{const f=e.target.files[0];if(f)importBackup(await f.text());}}/></label></Row>
           <Row label="Encrypt Backup" sub="AES-GCM-256 optional encryption"><Tog k="encryptBackup" /></Row>
           {s.encryptBackup && <Row label="Backup Password"><input className="input" type="password" placeholder="Password…" value={s.encryptPassword||""} onChange={e=>set_("encryptPassword",e.target.value)} style={{maxWidth:200}} /></Row>}
-          <Row label="Reset Stats" sub="Clear all progress for this profile"><button className="btn btn-sm" style={{background:"var(--red)15",color:"var(--red)",border:"1px solid var(--red)40"}} onClick={()=>{if(confirm("Reset all stats?"))resetAllStats();}}>Reset</button></Row>
+          <Row label="Reset Stats" sub="Clear all progress for this profile"><button className="btn btn-sm" style={{background:"var(--red)15",color:"var(--red)",border:"1px solid var(--red)40"}} onClick={()=>{if(window.confirm("Reset all stats?"))resetAllStats();}}>Reset</button></Row>
         </>)}
 
         {/* ── Cloud / Google Drive Tab ─────────────────────── */}
@@ -4093,7 +4097,7 @@ function ProfilesScreen() {
                     </div>
                   </div>
                   <button className="btn btn-ghost btn-sm"
-                    onClick={e=>{e.stopPropagation();if(confirm(`Delete "${p.name}"?`))deleteProfile(p.id);}}>🗑</button>
+                    onClick={e=>{e.stopPropagation();if(window.confirm(`Delete "${p.name}"?`))deleteProfile(p.id);}}>🗑</button>
                   <div style={{fontSize:20,color:"var(--muted)"}}>›</div>
                 </div>
               ))}
@@ -4248,7 +4252,7 @@ function SubjectsScreen() {
             <div style={{display:"flex",gap:6}}>
               <button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation();setCSVSubId(s.id);}} title="Import Questions">📥</button>
               <button className="btn btn-ghost btn-sm" onClick={()=>navigate("topics",{subjectId:s.id})}>›</button>
-              <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm(`Delete "${s.name}"?`))deleteSubject(s.id);}}>🗑</button>
+              <button className="btn btn-ghost btn-sm" onClick={()=>{if(window.confirm(`Delete "${s.name}"?`))deleteSubject(s.id);}}>🗑</button>
             </div>
           </div>
         </div>
@@ -4291,7 +4295,7 @@ function TopicsScreen() {
               <button className="btn btn-primary btn-sm" onClick={()=>navigate("subtopics",{topicId:t.id,subjectId:nav.subjectId})}>Open</button>
               {qs.length>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{topicId:t.id,subjectId:nav.subjectId,questionMode:"mixed"})}>Quiz</button>}
               {imageCount>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{topicId:t.id,subjectId:nav.subjectId,questionMode:"image"})}>Image Quiz</button>}
-              <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm(`Delete "${t.name}"?`))deleteTopic(t.id);}}>🗑</button>
+              <button className="btn btn-ghost btn-sm" onClick={()=>{if(window.confirm(`Delete "${t.name}"?`))deleteTopic(t.id);}}>🗑</button>
             </div>
           </div>
         );
@@ -4338,8 +4342,8 @@ function SubtopicsScreen() {
               {qs.length>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{subtopicId:st.id})}>📝 Quiz</button>}
               {weak&&<button className="btn btn-accent btn-sm" onClick={()=>navigate("flash",{subtopicId:st.id,preloadedQs:weak.questions})}>⚠️ Weak</button>}
               <button className="btn btn-ghost btn-sm" onClick={()=>navigate("questions",{subtopicId:st.id})}>📋 Qs</button>
-              <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm("Reset?"))resetSubtopicProgress(st.id);}}>↩</button>
-              <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm(`Delete "${st.name}"?`))deleteSubtopic(st.id);}}>🗑</button>
+              <button className="btn btn-ghost btn-sm" onClick={()=>{if(window.confirm("Reset?"))resetSubtopicProgress(st.id);}}>↩</button>
+              <button className="btn btn-ghost btn-sm" onClick={()=>{if(window.confirm(`Delete "${st.name}"?`))deleteSubtopic(st.id);}}>🗑</button>
             </div>
           </div>
         );
@@ -4385,7 +4389,7 @@ function QuestionsScreen() {
                   <div style={{fontSize:12,color:"var(--green)"}}>{answerPreview}</div>
                   {q.explanation&&<div style={{fontSize:11,color:"var(--primary)",marginTop:3}}>💡 {q.explanation.slice(0,60)}</div>}
                 </div>
-                <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm("Delete?"))deleteQuestion(q.id);}}>🗑</button>
+                <button className="btn btn-ghost btn-sm" onClick={()=>{if(window.confirm("Delete?"))deleteQuestion(q.id);}}>🗑</button>
               </div>
             </div>
           );})
