@@ -1,5 +1,5 @@
 // ╔══════════════════════════════════════════════════════════════════════╗
-// ║  FLASHMASTER v5.1.0                                                    ║
+// ║  FLASHMASTER v6.0.0                                                    ║
 // ║  Mandatory Google Login · Continuous Drive Sync                      ║
 // ╠══════════════════════════════════════════════════════════════════════╣
 // ║  ✦ Real Dexie.js from CDN with proper indexes                       ║
@@ -29,6 +29,17 @@ import {
 } from "recharts";
 
 const GOOGLE_CLIENT_ID = (import.meta.env.VITE_GOOGLE_CLIENT_ID || "").trim();
+const GOOGLE_IMAGE_SEARCH_API_KEY = (import.meta.env.VITE_GOOGLE_IMAGE_SEARCH_API_KEY || "").trim();
+const GOOGLE_IMAGE_SEARCH_CX = (import.meta.env.VITE_GOOGLE_IMAGE_SEARCH_CX || "").trim();
+const CLOUDFLARE_ACCOUNT_ID = (import.meta.env.VITE_CLOUDFLARE_ACCOUNT_ID || "").trim();
+const CLOUDFLARE_API_TOKEN = (import.meta.env.VITE_CLOUDFLARE_API_TOKEN || "").trim();
+const CLOUDFLARE_IMAGE_MODEL = (import.meta.env.VITE_CLOUDFLARE_IMAGE_MODEL || "@cf/bytedance/stable-diffusion-xl-lightning").trim();
+const GOOGLE_IMAGE_SEARCH_ENABLED = !!(GOOGLE_IMAGE_SEARCH_API_KEY && GOOGLE_IMAGE_SEARCH_CX);
+const CLOUDFLARE_IMAGE_ENABLED = !!(CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN);
+const GENERATED_IMAGE_CACHE = new Map();
+const GENERATED_IMAGE_PENDING = new Map();
+const GOOGLE_IMAGE_CACHE = new Map();
+const GOOGLE_IMAGE_PENDING = new Map();
 
 // ══════════════════════════════════════════════════════════════
 // §1  DEXIE LOADER  — loads real Dexie.js from CDN at runtime
@@ -607,8 +618,65 @@ class ReviewQueue {
 // ══════════════════════════════════════════════════════════════
 // §5  CSV ENGINE  — parse → validate → preview → import
 // ══════════════════════════════════════════════════════════════
-const VALID_TYPES = ["MCQ","FillBlank","TrueFalse","Match","Order","Dictation","MultiSelect","Cloze","Image","Audio"];
+const VALID_TYPES = ["Text","Image","MCQ","FillBlank","TrueFalse","Match","Order","Dictation","MultiSelect","Cloze","Audio"];
 const VALID_DIFF  = ["easy","medium","hard"];
+
+function normalizeQuestionType(questionOrType, media = "") {
+  const rawType = typeof questionOrType === "string" ? questionOrType : questionOrType?.type;
+  const rawMedia = typeof questionOrType === "string" ? media : questionOrType?.media;
+  const type = String(rawType || "").trim().toLowerCase();
+  if (type === "image") return "Image";
+  if (type === "audio") return "Audio";
+  if (type === "text") return "Text";
+  if (!type && rawMedia) return "Image";
+  return rawType || "Text";
+}
+
+function isImageQuestion(question) {
+  return normalizeQuestionType(question) === "Image";
+}
+
+function formatAnswerTypeLabel(key) {
+  const cleaned = String(key || "answer").replace(/^answer[-_]?/i, "").replace(/[_-]+/g, " ").trim();
+  if (!cleaned) return "Answer";
+  return cleaned.replace(/\b\w/g, ch => ch.toUpperCase());
+}
+
+function hashString(input = "") {
+  let hash = 0;
+  for (let i = 0; i < input.length; i++) hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
+  return hash;
+}
+
+function escapeSvgText(text = "") {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function splitPromptLines(text, maxChars = 22, maxLines = 3) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return ["Image prompt"];
+  const lines = [];
+  let current = "";
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length > maxChars && current) {
+      lines.push(current);
+      current = word;
+      if (lines.length === maxLines - 1) break;
+    } else {
+      current = next;
+    }
+  }
+  if (lines.length < maxLines && current) lines.push(current);
+  const usedWords = lines.join(" ").split(/\s+/).filter(Boolean).length;
+  if (usedWords < words.length) lines[lines.length - 1] = `${lines[lines.length - 1]}…`;
+  return lines.slice(0, maxLines);
+}
 
 const CSV = {
   parseRow(line) {
@@ -634,11 +702,15 @@ const CSV = {
     const errors = [], warnings = [];
 
     const idx = name => headers.indexOf(name);
-    const qCol  = [idx("question_text"), idx("question"), idx("q")].find(i => i >= 0);
-    const aCol  = [idx("answer"), idx("a")].find(i => i >= 0);
+    const qCol = [idx("question_text"), idx("question"), idx("q")].find(i => i >= 0);
+    const aCol = [idx("answer"), idx("a")].find(i => i >= 0);
+    const mediaCol = idx("media");
+    const answerTypeCols = headers.map((header, index) =>
+      header.startsWith("answer-") ? { key: header.slice(7), index } : null
+    ).filter(Boolean);
 
-    if (qCol === undefined) return { rows: [], errors: ["Missing column: question_text or question"], warnings: [], preview: [] };
-    if (aCol === undefined) return { rows: [], errors: ["Missing column: answer"], warnings: [], preview: [] };
+    if (qCol === undefined && mediaCol < 0) return { rows: [], errors: ["Missing column: question_text, question, or media"], warnings: [], preview: [] };
+    if (aCol === undefined && !answerTypeCols.length) return { rows: [], errors: ["Missing column: answer or answer-{answer-type}"], warnings: [], preview: [] };
 
     const rows = [], preview = [];
 
@@ -647,29 +719,49 @@ const CSV = {
       const c = this.parseRow(line);
       const get = (i, fb = "") => (i !== undefined && i >= 0 ? c[i] || "" : fb).trim();
 
-      const qt  = get(qCol);
-      const ans = get(aCol);
-      if (!qt)  { warnings.push(`Row ${li+2}: empty question — skipped`); return; }
-      if (!ans) { warnings.push(`Row ${li+2}: empty answer — skipped`); return; }
-
       const rawType = get(idx("type"));
       const rawDiff = get(idx("difficulty")) || get(idx("diff")) || "medium";
-      const type    = VALID_TYPES.includes(rawType) ? rawType : (get(idx("options")) ? "MCQ" : "FillBlank");
-      const diff    = VALID_DIFF.includes(rawDiff) ? rawDiff : "medium";
+      const media = get(mediaCol);
+      const normalizedCsvType = String(rawType || "").trim().toLowerCase();
+      const type = normalizedCsvType === "image" ? "Image" : normalizedCsvType === "text" ? "Text" : (media ? "Image" : "Text");
+      const diff = VALID_DIFF.includes(rawDiff) ? rawDiff : "medium";
+      const answerVariants = answerTypeCols
+        .map(col => {
+          const value = get(col.index);
+          if (!value) return null;
+          return {
+            key: col.key,
+            label: formatAnswerTypeLabel(col.key),
+            value,
+            isDefault: false,
+          };
+        })
+        .filter(Boolean);
+      const legacyAnswer = get(aCol);
+      if (!answerVariants.length && legacyAnswer) {
+        answerVariants.push({ key:"answer", label:"Answer", value:legacyAnswer, isDefault:true });
+      }
+      const qt = get(qCol) || getMediaPrompt(type);
+      if (!qt) { warnings.push(`Row ${li+2}: empty question — skipped`); return; }
+      if (!answerVariants.length) { warnings.push(`Row ${li+2}: empty answer — skipped`); return; }
 
-      if (rawType && !VALID_TYPES.includes(rawType))
+      if (rawType && !["text","image"].includes(normalizedCsvType))
         warnings.push(`Row ${li+2}: unknown type "${rawType}" → defaulted to ${type}`);
 
+      const primaryAnswer = answerVariants[0];
       const row = {
-        question_text:  qt,
-        answer:         ans,
-        options:        get(idx("options")),
+        question_text:   qt,
+        answer:          primaryAnswer.value,
+        answerTypeKey:   primaryAnswer.key,
+        answerTypeLabel: primaryAnswer.label,
+        answerVariants,
+        options:         "",
         type,
-        difficulty:     diff,
-        tags:           get(idx("tags")),
-        media:          get(idx("media")),
-        explanation:    get(idx("explanation")) || get(idx("explain")),
-        subtopic_hint:  get(idx("subtopic")) || get(idx("subtopic_hint")),
+        difficulty:      diff,
+        tags:            get(idx("tags")),
+        media,
+        explanation:     get(idx("explanation")) || get(idx("explain")),
+        subtopic_hint:   get(idx("subtopic")) || get(idx("subtopic_hint")),
       };
       rows.push(row);
       if (preview.length < 5) preview.push(row);
@@ -688,6 +780,374 @@ const CSV = {
     return groups;
   },
 };
+
+function getMediaPrompt(type) {
+  const normalized = normalizeQuestionType(type);
+  if (normalized === "Image") return "Identify the picture.";
+  if (normalized === "Audio") return "Listen and answer.";
+  return "";
+}
+
+function getQuestionAnswerEntries(question) {
+  const variants = Array.isArray(question?.answerVariants)
+    ? question.answerVariants
+        .map((entry, index) => ({
+          key: entry?.key || `answer_${index + 1}`,
+          label: entry?.label || formatAnswerTypeLabel(entry?.key),
+          value: String(entry?.value || "").trim(),
+          isDefault: !!entry?.isDefault,
+        }))
+        .filter(entry => entry.value)
+    : [];
+  if (variants.length) return variants;
+  const answer = String(question?.answer || "").trim();
+  if (!answer) return [];
+  return [{
+    key: question?.answerTypeKey || "answer",
+    label: question?.answerTypeLabel || "Answer",
+    value: answer,
+    isDefault: true,
+  }];
+}
+
+function pickQuestionAnswerEntry(question, preferredKey = "", seed = "") {
+  const entries = getQuestionAnswerEntries(question);
+  if (!entries.length) return { key:"answer", label:"Answer", value:"", isDefault:true };
+  if (preferredKey) {
+    const exact = entries.find(entry => entry.key === preferredKey || entry.label.toLowerCase() === String(preferredKey).toLowerCase());
+    if (exact) return exact;
+  }
+  if (!seed) return entries[0];
+  return entries[hashString(`${question?.id || ""}:${seed}`) % entries.length];
+}
+
+function getQuestionAnswerPreview(question, limit = 2) {
+  const entries = getQuestionAnswerEntries(question);
+  if (!entries.length) return "";
+  const preview = entries.slice(0, limit).map(entry =>
+    entry.isDefault || entry.label === "Answer" ? entry.value : `${entry.label}: ${entry.value}`
+  ).join(" · ");
+  return entries.length > limit ? `${preview} …` : preview;
+}
+
+function getBaseQuestionPrompt(question) {
+  if (!question) return "";
+  return (question.baseQuestionText || question.question_text || "").trim() || getMediaPrompt(question);
+}
+
+function buildQuestionPrompt(question, answerEntry = null) {
+  const base = getBaseQuestionPrompt(question);
+  const activeAnswer = answerEntry || (
+    question?.answerTypeLabel
+      ? { key: question.answerTypeKey, label: question.answerTypeLabel, value: question.answer, isDefault: question.answerTypeKey === "answer" }
+      : null
+  );
+  if (!activeAnswer || activeAnswer.isDefault || activeAnswer.label === "Answer") return base;
+  const prefix = base ? (/[.?!]$/.test(base) ? base : `${base}.`) : "";
+  return `${prefix}${prefix ? " " : ""}Provide the ${activeAnswer.label.toLowerCase()}.`;
+}
+
+function prepareQuestionForStudy(question, preferredKey = "", seed = "") {
+  if (!question) return null;
+  const answerEntry = pickQuestionAnswerEntry(question, preferredKey, seed);
+  const type = normalizeQuestionType(question);
+  return {
+    ...question,
+    type,
+    baseQuestionText: getBaseQuestionPrompt(question),
+    question_text: buildQuestionPrompt({ ...question, type }, answerEntry),
+    answer: answerEntry.value,
+    answerTypeKey: answerEntry.key,
+    answerTypeLabel: answerEntry.label,
+    answerVariants: getQuestionAnswerEntries(question),
+  };
+}
+
+function getQuestionPrompt(question) {
+  if (!question) return "";
+  if (question.answerTypeLabel || question.baseQuestionText) return question.question_text || buildQuestionPrompt(question);
+  return getBaseQuestionPrompt(question);
+}
+
+function getQuestionLabel(question) {
+  return getQuestionPrompt(question) || "Untitled question";
+}
+
+function getAnswerPlaceholder(type, answerTypeLabel = "") {
+  const normalized = normalizeQuestionType(type);
+  const typedLabel = answerTypeLabel && answerTypeLabel !== "Answer" ? answerTypeLabel.toLowerCase() : "";
+  if (normalized === "Image") return typedLabel ? `Type the ${typedLabel}...` : "Identify the picture...";
+  if (normalized === "Audio" || normalized === "Dictation") return "Type what you hear...";
+  if (typedLabel) return `Type the ${typedLabel}...`;
+  return "Type your answer...";
+}
+
+function getQuestionImageSubject(question) {
+  const basePrompt = getBaseQuestionPrompt(question);
+  const primaryAnswer = getQuestionAnswerEntries(question)[0]?.value || "";
+  const cleanedBase = basePrompt
+    .replace(/^identify (this|the)?\s*(picture|image|photo|object|item|animal|fruit|vegetable|place|monument)?\.?$/i, "")
+    .replace(/^name (this|the)?\s*(picture|image|photo|object|item|animal|fruit|vegetable|place|monument)?\.?$/i, "")
+    .replace(/^what is shown in (this|the)\s*(picture|image|photo)\??$/i, "")
+    .replace(/^look at (this|the)\s*(picture|image|photo)\.?$/i, "")
+    .trim();
+  return cleanedBase || primaryAnswer;
+}
+
+function getQuestionImagePrompt(question) {
+  const subject = getQuestionImageSubject(question);
+  if (!subject) return "";
+  const phrasing = /^(a|an|the)\b/i.test(subject) ? subject : `a clean educational illustration of ${subject}`;
+  return `${phrasing}. Single subject, centered composition, realistic colors, no text, no labels, no watermark, no border, no collage.`;
+}
+
+function getQuestionImageSearchQuery(question) {
+  const subject = getQuestionImageSubject(question);
+  if (!subject) return "";
+  return `${subject} reference image`;
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error("Failed to read generated image"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+const CloudflareImages = {
+  isConfigured() {
+    return CLOUDFLARE_IMAGE_ENABLED;
+  },
+
+  async generate(question) {
+    if (!this.isConfigured()) return "";
+    const prompt = getQuestionImagePrompt(question);
+    if (!prompt) return "";
+
+    const cacheKey = `${CLOUDFLARE_IMAGE_MODEL}:${prompt}`;
+    if (GENERATED_IMAGE_CACHE.has(cacheKey)) return GENERATED_IMAGE_CACHE.get(cacheKey);
+    if (GENERATED_IMAGE_PENDING.has(cacheKey)) return GENERATED_IMAGE_PENDING.get(cacheKey);
+
+    const task = (async () => {
+      const modelPath = CLOUDFLARE_IMAGE_MODEL.replace(/^\/+/, "");
+      const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${modelPath}`;
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+          "Content-Type": "application/json",
+          Accept: "image/png,image/*,application/json",
+        },
+        body: JSON.stringify({ prompt }),
+      });
+
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`Cloudflare image generation failed (${response.status})${detail ? `: ${detail.slice(0, 140)}` : ""}`);
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+      let imageSrc = "";
+
+      if (contentType.includes("application/json")) {
+        const payload = await response.json();
+        const encoded = payload?.result?.image || payload?.result?.b64_json || payload?.image || payload?.result;
+        if (typeof encoded === "string" && encoded.startsWith("data:image/")) {
+          imageSrc = encoded;
+        } else if (typeof encoded === "string" && /^https?:\/\//i.test(encoded)) {
+          imageSrc = encoded;
+        } else if (typeof encoded === "string" && encoded.trim()) {
+          imageSrc = `data:image/png;base64,${encoded}`;
+        } else {
+          throw new Error("Cloudflare returned JSON without image data");
+        }
+      } else {
+        imageSrc = await blobToDataUrl(await response.blob());
+      }
+
+      GENERATED_IMAGE_CACHE.set(cacheKey, imageSrc);
+      return imageSrc;
+    })()
+      .catch(err => {
+        console.warn("[FM6] Cloudflare image generation:", err.message);
+        return "";
+      })
+      .finally(() => GENERATED_IMAGE_PENDING.delete(cacheKey));
+
+    GENERATED_IMAGE_PENDING.set(cacheKey, task);
+    return task;
+  },
+};
+
+const GoogleImageSearch = {
+  isConfigured() {
+    return GOOGLE_IMAGE_SEARCH_ENABLED;
+  },
+
+  async findImage(question) {
+    if (!this.isConfigured()) return "";
+    const query = getQuestionImageSearchQuery(question);
+    if (!query) return "";
+
+    const cacheKey = `${GOOGLE_IMAGE_SEARCH_CX}:${query}`;
+    if (GOOGLE_IMAGE_CACHE.has(cacheKey)) return GOOGLE_IMAGE_CACHE.get(cacheKey);
+    if (GOOGLE_IMAGE_PENDING.has(cacheKey)) return GOOGLE_IMAGE_PENDING.get(cacheKey);
+
+    const task = (async () => {
+      const params = new URLSearchParams({
+        key: GOOGLE_IMAGE_SEARCH_API_KEY,
+        cx: GOOGLE_IMAGE_SEARCH_CX,
+        q: query,
+        searchType: "image",
+        num: "5",
+        safe: "active",
+        imgSize: "large",
+      });
+      const response = await fetch(`https://www.googleapis.com/customsearch/v1?${params.toString()}`);
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`Google image search failed (${response.status})${detail ? `: ${detail.slice(0, 140)}` : ""}`);
+      }
+      const payload = await response.json();
+      const result = Array.isArray(payload?.items)
+        ? payload.items.find(item => typeof item?.link === "string" && /^https?:\/\//i.test(item.link))
+        : null;
+      if (!result?.link) throw new Error("Google image search returned no usable image result");
+      GOOGLE_IMAGE_CACHE.set(cacheKey, result.link);
+      return result.link;
+    })()
+      .catch(err => {
+        console.warn("[FM6] Google image search:", err.message);
+        return "";
+      })
+      .finally(() => GOOGLE_IMAGE_PENDING.delete(cacheKey));
+
+    GOOGLE_IMAGE_PENDING.set(cacheKey, task);
+    return task;
+  },
+};
+
+function createGeneratedQuestionImage(question) {
+  const prompt = getBaseQuestionPrompt(question) || "Generated image prompt";
+  const lines = splitPromptLines(prompt);
+  const answerType = question?.answerTypeLabel && question.answerTypeLabel !== "Answer" ? question.answerTypeLabel : "";
+  const palette = [
+    ["#0F172A", "#1D4ED8", "#38BDF8"],
+    ["#0B1120", "#166534", "#4ADE80"],
+    ["#111827", "#9333EA", "#F472B6"],
+    ["#131A2B", "#B45309", "#FBBF24"],
+  ];
+  const colors = palette[hashString(prompt) % palette.length];
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="720" height="480" viewBox="0 0 720 480">
+      <defs>
+        <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="${colors[0]}"/>
+          <stop offset="55%" stop-color="${colors[1]}"/>
+          <stop offset="100%" stop-color="${colors[2]}"/>
+        </linearGradient>
+      </defs>
+      <rect width="720" height="480" rx="36" fill="url(#bg)"/>
+      <circle cx="96" cy="90" r="54" fill="rgba(255,255,255,.12)"/>
+      <circle cx="620" cy="118" r="82" fill="rgba(255,255,255,.08)"/>
+      <rect x="58" y="290" width="604" height="124" rx="28" fill="rgba(15,23,42,.34)" stroke="rgba(255,255,255,.18)"/>
+      <text x="72" y="78" fill="rgba(255,255,255,.88)" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="700">FlashMaster v6</text>
+      ${lines.map((line, index) => `<text x="72" y="${188 + index * 52}" fill="#FFFFFF" font-family="Segoe UI, Arial, sans-serif" font-size="34" font-weight="700">${escapeSvgText(line)}</text>`).join("")}
+      ${answerType ? `<text x="72" y="348" fill="rgba(255,255,255,.88)" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="600">Answer type: ${escapeSvgText(answerType)}</text>` : ""}
+      <text x="72" y="386" fill="rgba(255,255,255,.72)" font-family="Segoe UI, Arial, sans-serif" font-size="18">Generated fallback image</text>
+    </svg>
+  `;
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+}
+
+function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
+  const fallbackSvg = useMemo(
+    () => isImageQuestion(question) ? createGeneratedQuestionImage(question) : "",
+    [question?.id, question?.media, question?.question_text, question?.baseQuestionText, question?.answerTypeLabel]
+  );
+  const generationSeed = `${question?.id || ""}:${question?.media || ""}:${question?.baseQuestionText || question?.question_text || ""}:${question?.answer || ""}`;
+  const [src, setSrc] = useState(() => question?.media || fallbackSvg);
+  const [loadingFallback, setLoadingFallback] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState("");
+  const [fallbackTried, setFallbackTried] = useState(false);
+
+  const resolveFallbackImage = useCallback(async () => {
+    if (!isImageQuestion(question) || fallbackTried) return;
+    setFallbackTried(true);
+    setLoadingFallback(true);
+
+    if (CloudflareImages.isConfigured()) {
+      setLoadingMessage("Generating image with Cloudflare AI...");
+      const generated = await CloudflareImages.generate(question);
+      if (generated) {
+        setSrc(generated);
+        setLoadingFallback(false);
+        setLoadingMessage("");
+        return;
+      }
+    }
+
+    if (GoogleImageSearch.isConfigured()) {
+      setLoadingMessage("Searching Google Images...");
+      const searched = await GoogleImageSearch.findImage(question);
+      if (searched) {
+        setSrc(searched);
+        setLoadingFallback(false);
+        setLoadingMessage("");
+        return;
+      }
+    }
+
+    if (fallbackSvg) setSrc(fallbackSvg);
+    setLoadingFallback(false);
+    setLoadingMessage("");
+  }, [question, fallbackTried, fallbackSvg]);
+
+  useEffect(() => {
+    setSrc(question?.media || fallbackSvg);
+    setLoadingFallback(false);
+    setLoadingMessage("");
+    setFallbackTried(false);
+  }, [generationSeed, question?.media, fallbackSvg]);
+
+  useEffect(() => {
+    if (!question?.media) resolveFallbackImage();
+  }, [question?.media, resolveFallbackImage]);
+
+  if (!question?.media && !fallbackSvg) return null;
+  if (isImageQuestion(question)) {
+    return (
+      <div style={{ width:"100%" }}>
+        <img
+          src={src || fallbackSvg}
+          alt="Question prompt"
+          style={{ maxWidth:"100%", maxHeight, borderRadius:10, marginBottom, objectFit:"contain", display:"block" }}
+          onError={e => {
+            e.currentTarget.style.display = "block";
+            if (!fallbackTried && (CloudflareImages.isConfigured() || GoogleImageSearch.isConfigured())) {
+              setSrc(fallbackSvg);
+              resolveFallbackImage();
+              return;
+            }
+            if (fallbackSvg && src !== fallbackSvg) setSrc(fallbackSvg);
+            else e.currentTarget.style.display = "none";
+          }}
+        />
+        {loadingFallback && (
+          <div style={{ fontSize:11, color:"var(--muted)", marginTop:-2, marginBottom }}>
+            {loadingMessage || "Resolving image..."}
+          </div>
+        )}
+      </div>
+    );
+  }
+  if (normalizeQuestionType(question) === "Audio") {
+    return <audio controls src={question.media} style={{ width:"100%", marginBottom }} onClick={e => e.stopPropagation()} />;
+  }
+  return null;
+}
 
 // ══════════════════════════════════════════════════════════════
 // §6  SPEECH ENGINE  — with WebKit fallback + pronunciation scoring
@@ -1286,7 +1746,7 @@ function AppProvider({ children }) {
           setQuestions(allQ); setFlashProg(allFP); setQA(allQA); setLB(allLB); setRH(allRH);
         }
       } catch (e) {
-        console.warn("[FM5.1] Drive pull on login:", e.message);
+        console.warn("[FM6] Drive pull on login:", e.message);
       }
 
       setGdriveStatus("");
@@ -1294,7 +1754,7 @@ function AppProvider({ children }) {
       showToast(`Welcome, ${user.name}! ✅`);
       return user;
     } catch (e) {
-      console.error("[FM5.1] Google sign-in error:", e);
+      console.error("[FM6] Google sign-in error:", e);
       setGdriveStatus("");
       showToast("Google sign-in failed: " + e.message, "error");
     }
@@ -1327,9 +1787,9 @@ function AppProvider({ children }) {
         const tids = data.topics.filter(t => sids.includes(t.sid)).map(t => t.id);
         const stids = data.subtopics.filter(s => tids.includes(s.tid)).map(s => s.id);
         const profileData = {
-          version: 5,
+          version: 6,
           syncedAt: new Date().toISOString(),
-          syncVersion: "v5.1",
+          syncVersion: "v6.0",
           profiles:     data.profiles.filter(p => p.id === uid_),
           subjects:     data.subjects.filter(s => s.uid === uid_),
           topics:       data.topics.filter(t => sids.includes(t.sid)),
@@ -1346,7 +1806,7 @@ function AppProvider({ children }) {
         setLastSyncedAt(ts);
         localStorage.setItem("fm_last_synced", ts);
       } catch (e) {
-        console.warn("[FM5.1] Auto-sync failed:", e.message);
+        console.warn("[FM6] Auto-sync failed:", e.message);
         setGdriveStatus("⚠️ Sync failed – will retry");
       }
     }, 4000);
@@ -1375,7 +1835,7 @@ function AppProvider({ children }) {
       const tids = data.topics.filter(t => sids.includes(t.sid)).map(t => t.id);
       const stids = data.subtopics.filter(s => tids.includes(s.tid)).map(s => s.id);
       const profileData = {
-        version: 5, syncedAt: new Date().toISOString(), syncVersion: "v5.1",
+        version: 6, syncedAt: new Date().toISOString(), syncVersion: "v6.0",
         profiles:     data.profiles.filter(p => p.id === uid_),
         subjects:     data.subjects.filter(s => s.uid === uid_),
         topics:       data.topics.filter(t => sids.includes(t.sid)),
@@ -1445,7 +1905,7 @@ function AppProvider({ children }) {
     const blob = new Blob([payload], { type: "application/json" });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
-    a.href = url; a.download = `flashmaster_v4_${Date.now()}.json`;
+    a.href = url; a.download = `flashmaster_v6_${Date.now()}.json`;
     a.click(); URL.revokeObjectURL(url);
     showToast("Backup exported!");
   }
@@ -1518,7 +1978,7 @@ function AppProvider({ children }) {
   if (!dbReady) return (
     <div style={{ minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", background:"#060A16", color:"#E2E8F0", fontFamily:"sans-serif", flexDirection:"column", gap:16 }}>
       <div style={{ fontSize:52 }}>⚡</div>
-      <div style={{ fontWeight:800, fontSize:20, letterSpacing:-0.5 }}>FlashMaster v5</div>
+      <div style={{ fontWeight:800, fontSize:20, letterSpacing:-0.5 }}>FlashMaster v6</div>
       <div style={{ color:"#5A6882", fontSize:14 }}>Opening Dexie database…</div>
     </div>
   );
@@ -1693,10 +2153,10 @@ function QuestionRenderer({ question, userAnswer, onAnswer, checked, reverseMode
   const [listening, setListening] = useState(false);
   const { settings } = useApp();
 
-  useEffect(() => { setText(""); }, [question.id]);
+  useEffect(() => { setText(""); }, [question.id, question.answerTypeKey, question.answer]);
 
   const q = reverseMode
-    ? { ...question, question_text: `Answer: "${question.answer}"`, answer: question.question_text, type:"FillBlank", options:"" }
+    ? { ...question, question_text: `Answer: "${question.answer}"`, answer: question.question_text, type:"FillBlank", options:"", answerTypeKey:"answer", answerTypeLabel:"Answer" }
     : question;
 
   const opts = (q.options || "").split(",").map(s => s.trim()).filter(Boolean);
@@ -1779,12 +2239,11 @@ function QuestionRenderer({ question, userAnswer, onAnswer, checked, reverseMode
   return (
     <div>
       {effectiveType === "Dictation" && <button className="btn btn-accent" style={{ width:"100%", marginBottom:12, padding:16 }} onClick={() => Speech.speak(q.answer, ttsLang, ttsRate)}>🔊 Listen — type what you hear</button>}
-      {effectiveType === "Image" && q.media && <img src={q.media} alt="Q" style={{ maxWidth:"100%", maxHeight:160, borderRadius:10, marginBottom:10 }} onError={e => e.target.style.display = "none"} />}
-      {effectiveType === "Audio" && q.media && <audio controls src={q.media} style={{ width:"100%", marginBottom:10 }} />}
+      {["Image","Audio"].includes(effectiveType) && <QuestionMedia question={q} />}
       {showHint && !checked && <div style={{ fontSize:13, color:"var(--accent)", fontWeight:700, marginBottom:8 }}>💡 Starts with: {q.answer[0]?.toUpperCase()}</div>}
       <div style={{ display:"flex", gap:8 }}>
         <input className={`input ${checked ? (text.trim().toLowerCase().replace(/[.,!?]/g,"") === q.answer.trim().toLowerCase().replace(/[.,!?]/g,"") ? "input-correct" : "input-wrong") : ""}`}
-          placeholder="Type your answer…" value={text}
+          placeholder={getAnswerPlaceholder(effectiveType, q.answerTypeLabel)} value={text}
           onChange={e => handleText(e.target.value)}
           onKeyDown={e => e.key === "Enter" && text && onAnswer(text)}
           disabled={checked} autoFocus />
@@ -1996,6 +2455,8 @@ function FlashScreen() {
   const totalReps = settings.repetitionCount || 3;
   const current   = deck[idx];
   const isDone    = idx >= deck.length;
+  const studyCurrent = useMemo(() => prepareQuestionForStudy(current, "", `${idx}-${rep}`), [current, idx, rep]);
+  const questionPrompt = getQuestionLabel(studyCurrent);
 
   // Resume from draft
   useEffect(() => {
@@ -2026,8 +2487,8 @@ function FlashScreen() {
 
   // TTS
   useEffect(() => {
-    if (!current || !settings.autoTTS || isDone) return;
-    const t = setTimeout(() => Speech.speak(reverseMode ? current.answer : current.question_text, settings.ttsLang, settings.ttsRate), 300);
+    if (!studyCurrent || !settings.autoTTS || isDone) return;
+    const t = setTimeout(() => Speech.speak(reverseMode ? studyCurrent.answer : questionPrompt, settings.ttsLang, settings.ttsRate), 300);
     return () => { clearTimeout(t); Speech.cancel(); };
   }, [idx, reverseMode, rep]);
 
@@ -2124,7 +2585,7 @@ function FlashScreen() {
     );
   }
 
-  if (!current) return null;
+  if (!current || !studyCurrent) return null;
   const prog      = progMap.get(current.id);
   const retention = prog ? SRS.retention(prog) : null;
   const qLabel    = SRS.queueLabel(prog);
@@ -2162,28 +2623,31 @@ function FlashScreen() {
             <div className="flashcard-front">
               <div style={{ display:"flex", gap:6, marginBottom:10, flexWrap:"wrap", justifyContent:"center" }}>
                 {reverseMode && <Badge v="accent">Reverse</Badge>}
-                {current.type !== "FillBlank" && <Badge v="primary">{current.type}</Badge>}
-                {current.difficulty && <Badge v={current.difficulty === "easy" ? "green" : current.difficulty === "hard" ? "red" : "accent"}>{current.difficulty}</Badge>}
+                {studyCurrent.type !== "FillBlank" && <Badge v="primary">{studyCurrent.type}</Badge>}
+                {studyCurrent.answerTypeLabel && studyCurrent.answerTypeLabel !== "Answer" && <Badge v="accent">{studyCurrent.answerTypeLabel}</Badge>}
+                {studyCurrent.difficulty && <Badge v={studyCurrent.difficulty === "easy" ? "green" : studyCurrent.difficulty === "hard" ? "red" : "accent"}>{studyCurrent.difficulty}</Badge>}
                 {isMarked && <span style={{ color:"var(--accent)" }}>⚑</span>}
               </div>
-              <div style={{ fontFamily:"var(--syne)", fontWeight:700, fontSize:21, lineHeight:1.55, textAlign:"center", flex:1, display:"flex", alignItems:"center", justifyContent:"center", padding:"0 12px" }}>
-                {reverseMode ? current.answer : current.question_text}
+              <div style={{ fontFamily:"var(--syne)", fontWeight:700, fontSize:21, lineHeight:1.55, textAlign:"center", flex:1, display:"flex", flexDirection:"column", gap:16, alignItems:"center", justifyContent:"center", padding:"0 12px" }}>
+                {!reverseMode && <QuestionMedia question={studyCurrent} maxHeight={220} marginBottom={0} />}
+                <div>{reverseMode ? studyCurrent.answer : questionPrompt}</div>
               </div>
-              {showHint && !reverseMode && <div style={{ fontSize:13, color:"var(--accent)", fontWeight:700, marginTop:10 }}>💡 {current.answer?.[0]?.toUpperCase()}…</div>}
+              {showHint && !reverseMode && <div style={{ fontSize:13, color:"var(--accent)", fontWeight:700, marginTop:10 }}>💡 {studyCurrent.answer?.[0]?.toUpperCase()}…</div>}
               <div style={{ fontSize:12, color:"var(--muted)", marginTop:12 }}>Tap to flip · Space</div>
             </div>
             <div className="flashcard-back">
-              <div style={{ fontSize:11, color:"var(--muted)", fontWeight:700, letterSpacing:1.2, marginBottom:10, textTransform:"uppercase" }}>Answer</div>
-              <div style={{ fontFamily:"var(--syne)", fontWeight:700, fontSize:24, color:"var(--green)", lineHeight:1.5, textAlign:"center", flex:1, display:"flex", alignItems:"center", justifyContent:"center" }}>
-                {reverseMode ? current.question_text : current.answer}
+              <div style={{ fontSize:11, color:"var(--muted)", fontWeight:700, letterSpacing:1.2, marginBottom:10, textTransform:"uppercase" }}>{reverseMode ? "Question" : "Answer"}</div>
+              <div style={{ fontFamily:"var(--syne)", fontWeight:700, fontSize:reverseMode ? 21 : 24, color:reverseMode ? "var(--text)" : "var(--green)", lineHeight:1.5, textAlign:"center", flex:1, display:"flex", flexDirection:"column", gap:16, alignItems:"center", justifyContent:"center" }}>
+                {reverseMode && <QuestionMedia question={studyCurrent} maxHeight={220} marginBottom={0} />}
+                <div>{reverseMode ? questionPrompt : studyCurrent.answer}</div>
               </div>
               <div style={{ display:"flex", gap:8, marginTop:12 }}>
-                <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); Speech.speak(reverseMode ? current.question_text : current.answer, settings.ttsLang, settings.ttsRate); }}>🔊</button>
+                <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); Speech.speak(reverseMode ? questionPrompt : studyCurrent.answer, settings.ttsLang, settings.ttsRate); }}>🔊</button>
                 {settings.repeatAfterMe && <button className="btn btn-ghost btn-sm" style={{ color:"var(--accent)" }} onClick={e => { e.stopPropagation(); setShowRepeat(r => !r); }}>🎙️</button>}
               </div>
               {showRepeat && settings.repeatAfterMe && (
                 <div onClick={e => e.stopPropagation()} style={{ width:"100%", marginTop:8 }}>
-                  <RepeatAfterMe text={reverseMode ? current.question_text : current.answer} lang={settings.ttsLang} tolerance={settings.accentTolerance} />
+                  <RepeatAfterMe text={reverseMode ? questionPrompt : studyCurrent.answer} lang={settings.ttsLang} tolerance={settings.accentTolerance} />
                 </div>
               )}
             </div>
@@ -2193,17 +2657,17 @@ function FlashScreen() {
 
       {/* Answer input / Rating */}
       <div className="card">
-        {!flipped && !checked && ["MCQ","TrueFalse","MultiSelect","Match","Order","Cloze","Dictation"].includes(current.type) ? (
-          <QuestionRenderer question={current} userAnswer={userAnswer} onAnswer={a => { setUserAnswer(a); if (["MCQ","TrueFalse"].includes(current.type)) setFlipped(true); }}
+        {!flipped && !checked && ["MCQ","TrueFalse","MultiSelect","Match","Order","Cloze","Dictation"].includes(studyCurrent.type) ? (
+          <QuestionRenderer question={studyCurrent} userAnswer={userAnswer} onAnswer={a => { setUserAnswer(a); if (["MCQ","TrueFalse"].includes(studyCurrent.type)) setFlipped(true); }}
             checked={false} reverseMode={reverseMode} ttsLang={settings.ttsLang} ttsRate={settings.ttsRate} showHint={showHint} showExplanation={false} />
         ) : !flipped && !checked ? (
           <div>
             <div style={{ display:"flex", gap:8, marginBottom:10 }}>
-              <input className="input" placeholder="Type answer…" value={userAnswer} onChange={e => setUserAnswer(e.target.value)} onKeyDown={e => {
+              <input className="input" placeholder={getAnswerPlaceholder(studyCurrent.type, studyCurrent.answerTypeLabel)} value={userAnswer} onChange={e => setUserAnswer(e.target.value)} onKeyDown={e => {
   if (e.key === "Enter" && userAnswer) {
     const correct =
       userAnswer.trim().toLowerCase() ===
-      String(current.answer).trim().toLowerCase();
+      String(studyCurrent.answer).trim().toLowerCase();
     setIsCorrect(correct);
     setChecked(true);
   }
@@ -2217,7 +2681,7 @@ function FlashScreen() {
   onClick={() => {
     const correct =
       userAnswer.trim().toLowerCase() ===
-      String(current.answer).trim().toLowerCase();
+      String(studyCurrent.answer).trim().toLowerCase();
 
     setIsCorrect(correct);
     setChecked(true);
@@ -2240,7 +2704,7 @@ function FlashScreen() {
       marginBottom: 10,
       color: isCorrect ? "green" : "red"
   }}>
-    {isCorrect ? "✓ Correct" : `✗ Correct answer: ${current.answer}`}
+    {isCorrect ? "✓ Correct" : `✗ Correct answer: ${studyCurrent.answer}`}
   </div>
 )}
             <div style={{ fontSize:12, color:"var(--muted)", fontWeight:700, textAlign:"center", marginBottom:10 }}>HOW WAS IT? <span style={{ opacity:.5 }}>(swipe · 1–4)</span></div>
@@ -2296,7 +2760,7 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
           <div style={{ border:"2px dashed var(--border)", borderRadius:14, padding:40, textAlign:"center", marginBottom:16 }}>
             <div style={{ fontSize:48, marginBottom:12 }}>📥</div>
             <div style={{ fontWeight:700, fontSize:15, marginBottom:8 }}>Drop CSV or click to browse</div>
-            <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, answer, type, options, difficulty, subtopic, explanation</div>
+            <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, type, difficulty, subtopic, explanation, media, answer-{answer-type}</div>
             <label className="btn btn-primary btn-lg" style={{ cursor:"pointer" }}>
               Choose File
               <input type="file" accept=".csv,.txt" style={{ display:"none" }} onChange={e => e.target.files[0] && handleFile(e.target.files[0])} />
@@ -2306,10 +2770,10 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
           <div className="card" style={{ marginTop:16, padding:14 }}>
             <div style={{ fontWeight:700, fontSize:13, marginBottom:8 }}>📋 CSV Format Example</div>
             <pre style={{ fontSize:11, color:"var(--muted)", overflow:"auto", fontFamily:"monospace", lineHeight:1.8 }}>{
-`question_text,answer,type,options,difficulty,subtopic,explanation
-What is H2O?,Water,MCQ,"Water,Fire,Earth,Air",easy,Chemistry,H2O is the chemical formula
-Capital of France?,Paris,FillBlank,,medium,Geography,
-True or False: Sun is a star?,True,TrueFalse,,easy,Astronomy,`
+`question_text,type,difficulty,subtopic,explanation,media,answer-capital,answer-currency
+India,Text,medium,Geography,Answer one requested field,,New Delhi,Rupee
+Identify this fruit,Image,easy,Objects,Missing media will generate a fallback image,,Apple,
+Identify this monument,Image,medium,Landmarks,Uses the supplied image,https://example.com/taj-mahal.jpg,Taj Mahal,`
             }</pre>
           </div>
         </div>
@@ -2340,8 +2804,8 @@ True or False: Sun is a star?,True,TrueFalse,,easy,Astronomy,`
                   <Badge v="primary">{r.type}</Badge>
                   {r.subtopic_hint && <Badge v="muted">{r.subtopic_hint}</Badge>}
                 </div>
-                <div style={{ fontWeight:700 }}>{r.question_text}</div>
-                <div style={{ color:"var(--green)", fontSize:12 }}>→ {r.answer}</div>
+                <div style={{ fontWeight:700 }}>{getQuestionLabel(r)}</div>
+                <div style={{ color:"var(--green)", fontSize:12 }}>→ {getQuestionAnswerPreview(r)}</div>
               </div>
             ))}
           </div>
@@ -2376,17 +2840,22 @@ True or False: Sun is a star?,True,TrueFalse,,easy,Astronomy,`
 // ══════════════════════════════════════════════════════════════
 function QuizScreen() {
   const { questions, subtopics, settings, nav, navigate, saveQuizAttempt, currentProfile, selectAdaptive, applyRating } = useApp();
+  const questionMode = nav.questionMode || "mixed";
 
   const pool = useMemo(() => {
     if (nav.wrongOnly) return nav.wrongQs || [];
     const st = nav.subtopicId;
     const tid = nav.topicId;
-    return st ? questions.filter(q => q.stid === st)
-               : tid ? questions.filter(q => subtopics.find(s => s.id === q.stid)?.tid === tid) : [];
-  }, [nav, questions, subtopics]);
+    const basePool = st ? questions.filter(q => q.stid === st)
+                        : tid ? questions.filter(q => subtopics.find(s => s.id === q.stid)?.tid === tid) : [];
+    return basePool.filter(q => questionMode === "mixed" ? true : questionMode === "image" ? isImageQuestion(q) : !isImageQuestion(q));
+  }, [nav, questions, subtopics, questionMode]);
 
   const quizLen  = Math.min(pool.length, settings.quizLen || 10);
-  const [qList]  = useState(() => selectAdaptive(pool, quizLen));
+  const qList    = useMemo(
+    () => selectAdaptive(pool, quizLen).map((q, index) => prepareQuestionForStudy(q, "", `${questionMode}-${index}`)),
+    [pool, quizLen, questionMode]
+  );
   const [qi,  setQi]      = useState(0);
   const [ua,  setUa]      = useState("");
   const [results, setR]   = useState({});
@@ -2398,7 +2867,7 @@ function QuizScreen() {
   const current = qList[qi];
 
   useEffect(() => { setUa(""); setChk(false); setTL(settings.timerSec || 30); }, [qi]);
-  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak(current.question_text, settings.ttsLang, settings.ttsRate); }, [qi]);
+  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak(getQuestionLabel(current), settings.ttsLang, settings.ttsRate); }, [qi]);
 
   useEffect(() => {
     if (!settings.timerSec || checked || done || !current) return;
@@ -2451,7 +2920,13 @@ function QuizScreen() {
     setDone(true);
   }
 
-  if (!qList.length) return <Empty icon="❓" title="Not enough questions" sub="Add more questions first" action={<button className="btn btn-primary btn-lg" onClick={() => navigate("subtopics")}>Back</button>} />;
+  if (!qList.length) {
+    const emptyTitle = questionMode === "image" ? "No image questions" : questionMode === "text" ? "No text questions" : "Not enough questions";
+    const fallbackTopicId = nav.topicId || subtopics.find(s => s.id === nav.subtopicId)?.tid;
+    const backScreen = nav.topicId ? "topics" : "subtopics";
+    const backCtx = nav.topicId ? { subjectId: nav.subjectId } : { topicId: fallbackTopicId, subjectId: nav.subjectId };
+    return <Empty icon="❓" title={emptyTitle} sub="Import more questions first" action={<button className="btn btn-primary btn-lg" onClick={() => navigate(backScreen, backCtx)}>Back</button>} />;
+  }
 
   if (done) {
     const allResults = Object.values(results);
@@ -2469,8 +2944,8 @@ function QuizScreen() {
             <div key={i} style={{ display:"flex", alignItems:"flex-start", gap:10, marginBottom:12, paddingBottom:12, borderBottom:i<allResults.length-1?"1px solid var(--border)":"none" }}>
               <span style={{ fontSize:18, flexShrink:0 }}>{r.correct?"✅":"❌"}</span>
               <div style={{ flex:1 }}>
-                <div style={{ fontWeight:600, fontSize:13, marginBottom:3, lineHeight:1.4 }}>{r.question.question_text.slice(0,80)}{r.question.question_text.length>80?"…":""}</div>
-                {!r.correct && <><div style={{ fontSize:12, color:"var(--red)" }}>You: {r.answer||"(none)"}</div><div style={{ fontSize:12, color:"var(--green)" }}>✓ {r.question.answer}</div></>}
+                <div style={{ fontWeight:600, fontSize:13, marginBottom:3, lineHeight:1.4 }}>{getQuestionLabel(r.question).slice(0,80)}{getQuestionLabel(r.question).length>80?"…":""}</div>
+                {!r.correct && <><div style={{ fontSize:12, color:"var(--red)" }}>You: {r.answer||"(none)"}</div><div style={{ fontSize:12, color:"var(--green)" }}>✓ {r.question.answerTypeLabel && r.question.answerTypeLabel !== "Answer" ? `${r.question.answerTypeLabel}: ` : ""}{r.question.answer}</div></>}
                 {settings.showExplanations && r.question.explanation && <div style={{ fontSize:11, color:"var(--primary)", marginTop:4, fontStyle:"italic" }}>💡 {r.question.explanation}</div>}
               </div>
               <div style={{ fontSize:11, color:"var(--muted)", flexShrink:0 }}>{Math.round(r.responseMs/1000)}s</div>
@@ -2506,11 +2981,12 @@ function QuizScreen() {
       <div className="card" style={{ marginBottom:16, padding:24 }}>
         <div style={{ display:"flex", gap:6, marginBottom:12, flexWrap:"wrap" }}>
           <Badge v="primary">{current.type}</Badge>
+          {current.answerTypeLabel && current.answerTypeLabel !== "Answer" && <Badge v="accent">{current.answerTypeLabel}</Badge>}
           {current.difficulty && <Badge v={current.difficulty==="easy"?"green":current.difficulty==="hard"?"red":"accent"}>{current.difficulty}</Badge>}
           {nav.reverseMode && <Badge v="accent">Reverse</Badge>}
         </div>
         <div style={{ fontFamily:"var(--syne)", fontWeight:700, fontSize:20, lineHeight:1.6, color:"var(--text)", marginBottom:18 }}>
-          {nav.reverseMode ? `Answer: "${current.answer}"` : current.question_text}
+          {nav.reverseMode ? `Answer: "${current.answer}"` : getQuestionLabel(current)}
         </div>
         <QuestionRenderer question={current} userAnswer={ua} onAnswer={setUa} checked={checked}
           reverseMode={nav.reverseMode} ttsLang={settings.ttsLang} ttsRate={settings.ttsRate}
@@ -2518,7 +2994,7 @@ function QuizScreen() {
         {checked && (
           <div style={{ marginTop:14, padding:"12px 16px", borderRadius:10, background:curR?.correct?"#10B98115":"#EF444415", border:`1px solid ${curR?.correct?"var(--green)":"var(--red)"}40` }}>
             <div style={{ fontWeight:800, fontSize:16, color:curR?.correct?"var(--green)":"var(--red)" }}>{curR?.correct?"✅ Correct!":"❌ Incorrect"}</div>
-            {!curR?.correct && <div style={{ fontSize:13, marginTop:4 }}>Answer: <strong>{current.answer}</strong></div>}
+            {!curR?.correct && <div style={{ fontSize:13, marginTop:4 }}>{current.answerTypeLabel && current.answerTypeLabel !== "Answer" ? `${current.answerTypeLabel}: ` : "Answer: "}<strong>{current.answer}</strong></div>}
           </div>
         )}
       </div>
@@ -2722,7 +3198,7 @@ function AnalyticsScreen() {
               return (
                 <div key={i} style={{display:"flex",gap:10,marginBottom:8,padding:"8px 12px",background:"var(--surface)",borderRadius:8}}>
                   <div style={{width:8,height:8,borderRadius:"50%",background:SRS.retention(f)<30?"var(--red)":"var(--accent)",marginTop:5,flexShrink:0}} />
-                  <div style={{flex:1,fontSize:13}}>{q.question_text.slice(0,60)}…</div>
+                  <div style={{flex:1,fontSize:13}}>{getQuestionLabel(q).slice(0,60)}…</div>
                   <span style={{fontSize:11,color:"var(--muted)"}}>Box {f.box}</span>
                   <span style={{fontSize:11,color:"var(--accent)"}}>⏳ {SRS.retention(f)}%</span>
                 </div>
@@ -2839,6 +3315,39 @@ function SettingsScreen() {
               ? <div style={{fontSize:11,color:"var(--green)",marginTop:6}}>✅ Client ID configured</div>
               : <div style={{fontSize:11,color:"var(--red)",marginTop:6}}>❌ Missing VITE_GOOGLE_CLIENT_ID</div>
             }
+          </div>
+
+          <div style={{padding:"14px 0",borderBottom:"1px solid var(--border)"}}>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Cloudflare AI Image Generation</div>
+            <div style={{fontSize:12,color:"var(--muted)",marginBottom:10}}>
+              Missing image questions can request a generated image from Cloudflare Workers AI.
+            </div>
+            {CLOUDFLARE_IMAGE_ENABLED ? (
+              <>
+                <div style={{fontSize:11,color:"var(--green)",marginBottom:6}}>Configured</div>
+                <div style={{fontSize:11,color:"var(--muted)"}}>Model: <code style={{background:"var(--surface)",padding:"1px 5px",borderRadius:4}}>{CLOUDFLARE_IMAGE_MODEL}</code></div>
+              </>
+            ) : (
+              <div style={{fontSize:11,color:"var(--red)",marginBottom:6}}>Missing VITE_CLOUDFLARE_ACCOUNT_ID or VITE_CLOUDFLARE_API_TOKEN</div>
+            )}
+            <div style={{fontSize:11,color:"var(--accent)",marginTop:8,lineHeight:1.5}}>
+              This app calls Cloudflare directly from the browser. Use a restricted token, or move the call behind a server before production deployment.
+            </div>
+          </div>
+
+          <div style={{padding:"14px 0",borderBottom:"1px solid var(--border)"}}>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Google Image Search Fallback</div>
+            <div style={{fontSize:12,color:"var(--muted)",marginBottom:10}}>
+              If Cloudflare does not return an image, the app can use Google Programmable Search image results as a fallback source.
+            </div>
+            {GOOGLE_IMAGE_SEARCH_ENABLED ? (
+              <div style={{fontSize:11,color:"var(--green)",marginBottom:6}}>Configured</div>
+            ) : (
+              <div style={{fontSize:11,color:"var(--red)",marginBottom:6}}>Missing VITE_GOOGLE_IMAGE_SEARCH_API_KEY or VITE_GOOGLE_IMAGE_SEARCH_CX</div>
+            )}
+            <div style={{fontSize:11,color:"var(--accent)",marginTop:8,lineHeight:1.5}}>
+              Use a browser-restricted API key. This uses the official Google image search API, not brittle HTML scraping.
+            </div>
           </div>
 
           {/* Step 2: Sign In */}
@@ -2990,7 +3499,7 @@ function ProfilesScreen() {
       <div style={{textAlign:"center",marginBottom:28}}>
         <div style={{fontSize:56,marginBottom:8}}>⚡</div>
         <div style={{fontFamily:"var(--syne)",fontWeight:900,fontSize:30,letterSpacing:-.5}}>FlashMaster</div>
-        <div style={{color:"var(--muted)",fontSize:12,marginTop:4}}>v5.1 · Dexie.js · SM-2 · Drive Sync</div>
+        <div style={{color:"var(--muted)",fontSize:12,marginTop:4}}>v6.0 · Dexie.js · SM-2 · Drive Sync</div>
       </div>
 
       {/* Signed-in user badge */}
@@ -3212,13 +3721,25 @@ function TopicsScreen() {
       </div>
       {!myT.length?<Empty icon="📖" title="No topics" sub="Create a topic or import a CSV to auto-create" action={<button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Topic</button>}/>:myT.map(t=>{
         const stids=subtopics.filter(s=>s.tid===t.id).map(s=>s.id);
-        const qc=questions.filter(q=>stids.includes(q.stid)).length;
+        const qs=questions.filter(q=>stids.includes(q.stid));
+        const textCount=qs.filter(q=>!isImageQuestion(q)).length;
+        const imageCount=qs.filter(q=>isImageQuestion(q)).length;
         return(
-          <div key={t.id} className="card" style={{marginBottom:12,padding:"16px 20px",display:"flex",alignItems:"center",gap:14,cursor:"pointer"}} onClick={()=>navigate("subtopics",{topicId:t.id})}>
-            <div style={{fontSize:26}}>📂</div>
-            <div style={{flex:1}}><div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:16}}>{t.name}</div><div style={{fontSize:12,color:"var(--muted)"}}>{stids.length} subtopics · {qc} cards</div></div>
-            <button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation();if(confirm(`Delete "${t.name}"?`))deleteTopic(t.id);}}>🗑</button>
-            <div style={{fontSize:20,color:"var(--muted)"}}>›</div>
+          <div key={t.id} className="card" style={{marginBottom:12,padding:"16px 20px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:12}}>
+              <div style={{fontSize:26}}>📂</div>
+              <div style={{flex:1}}>
+                <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:16}}>{t.name}</div>
+                <div style={{fontSize:12,color:"var(--muted)"}}>{stids.length} subtopics · {qs.length} questions · {textCount} text · {imageCount} image</div>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              <button className="btn btn-primary btn-sm" onClick={()=>navigate("subtopics",{topicId:t.id,subjectId:nav.subjectId})}>Open</button>
+              {qs.length>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{topicId:t.id,subjectId:nav.subjectId,questionMode:"mixed"})}>Mixed Quiz</button>}
+              {textCount>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{topicId:t.id,subjectId:nav.subjectId,questionMode:"text"})}>Text Quiz</button>}
+              {imageCount>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{topicId:t.id,subjectId:nav.subjectId,questionMode:"image"})}>Image Quiz</button>}
+              <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm(`Delete "${t.name}"?`))deleteTopic(t.id);}}>🗑</button>
+            </div>
           </div>
         );
       })}
@@ -3276,59 +3797,47 @@ function SubtopicsScreen() {
 }
 
 function QuestionsScreen() {
-  const { questions, subtopics, addQuestion, deleteQuestion, nav } = useApp();
-  const [modal,setModal]=useState(false);
-  const [q,setQ]=useState({type:"FillBlank",question_text:"",answer:"",options:"",difficulty:"medium",explanation:""});
+  const { questions, subtopics, deleteQuestion, nav, navigate } = useApp();
   const myQs=questions.filter(q=>q.stid===nav.subtopicId);
   const st=subtopics.find(s=>s.id===nav.subtopicId);
-  async function create(){if(!q.question_text.trim()||!q.answer.trim())return;await addQuestion(nav.subtopicId,q);setQ({type:"FillBlank",question_text:"",answer:"",options:"",difficulty:"medium",explanation:""});setModal(false);}
-  // Use virtualized list for large question sets
   const useVirtual = myQs.length > 100;
   return(
     <div>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
         <div className="h1">{st?.name||"Questions"}</div>
-        <button className="btn btn-primary" onClick={()=>setModal(true)}>+ Question</button>
+        <button className="btn btn-ghost" onClick={()=>navigate("subjects")}>Import CSV</button>
       </div>
-      {!myQs.length?<Empty icon="❓" title="No questions" sub="Add manually or import CSV" action={<button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Add</button>}/>:(
+      {!myQs.length?<Empty icon="❓" title="No questions" sub="Questions are loaded from CSV imports only" action={<button className="btn btn-primary btn-lg" onClick={()=>navigate("subjects")}>Go To Subjects</button>}/>:( 
         useVirtual?(
-          <VirtualList items={myQs} itemHeight={80} containerHeight={520} renderItem={(q)=>(
-            <div className="card" style={{margin:"2px 0",padding:"10px 14px",height:76}}>
-              <div style={{display:"flex",gap:8,marginBottom:4}}><Badge v={q.difficulty==="easy"?"green":q.difficulty==="hard"?"red":"accent"}>{q.difficulty}</Badge><Badge v="primary">{q.type}</Badge></div>
-              <div style={{fontWeight:700,fontSize:13,lineHeight:1.3,overflow:"hidden",whiteSpace:"nowrap",textOverflow:"ellipsis"}}>{q.question_text}</div>
+          <VirtualList items={myQs} itemHeight={92} containerHeight={520} renderItem={(q)=>{
+            const label=getQuestionLabel(q);
+            const answerPreview=getQuestionAnswerPreview(q);
+            return(
+            <div className="card" style={{margin:"2px 0",padding:"10px 14px",height:88}}>
+              <div style={{display:"flex",gap:8,marginBottom:4,flexWrap:"wrap"}}><Badge v={q.difficulty==="easy"?"green":q.difficulty==="hard"?"red":"accent"}>{q.difficulty}</Badge><Badge v="primary">{normalizeQuestionType(q)}</Badge></div>
+              <div style={{fontWeight:700,fontSize:13,lineHeight:1.3,overflow:"hidden",whiteSpace:"nowrap",textOverflow:"ellipsis"}}>{label}</div>
+              <div style={{fontSize:12,color:"var(--green)",marginTop:4,overflow:"hidden",whiteSpace:"nowrap",textOverflow:"ellipsis"}}>{answerPreview}</div>
             </div>
-          )}/>
+          );}}/>
         ):(
-          myQs.map(q=>(
+          myQs.map(q=>{
+            const label=getQuestionLabel(q);
+            const answerPreview=getQuestionAnswerPreview(q);
+            return(
             <div key={q.id} className="card" style={{marginBottom:10,padding:"14px 18px"}}>
               <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
                 <div style={{flex:1}}>
-                  <div style={{display:"flex",gap:6,marginBottom:4,flexWrap:"wrap"}}><Badge v={q.difficulty==="easy"?"green":q.difficulty==="hard"?"red":"accent"}>{q.difficulty}</Badge><Badge v="primary">{q.type}</Badge></div>
-                  <div style={{fontWeight:700,fontSize:14,marginBottom:3}}>{q.question_text.slice(0,90)}{q.question_text.length>90?"…":""}</div>
-                  <div style={{fontSize:12,color:"var(--green)"}}>→ {q.answer.slice(0,60)}{q.answer.length>60?"…":""}</div>
+                  <div style={{display:"flex",gap:6,marginBottom:4,flexWrap:"wrap"}}><Badge v={q.difficulty==="easy"?"green":q.difficulty==="hard"?"red":"accent"}>{q.difficulty}</Badge><Badge v="primary">{normalizeQuestionType(q)}</Badge></div>
+                  <div style={{fontWeight:700,fontSize:14,marginBottom:3}}>{label.slice(0,90)}{label.length>90?"…":""}</div>
+                  <div style={{fontSize:12,color:"var(--green)"}}>{answerPreview}</div>
                   {q.explanation&&<div style={{fontSize:11,color:"var(--primary)",marginTop:3}}>💡 {q.explanation.slice(0,60)}</div>}
                 </div>
                 <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm("Delete?"))deleteQuestion(q.id);}}>🗑</button>
               </div>
             </div>
-          ))
+          );})
         )
       )}
-      {modal&&<Modal title="Add Question" onClose={()=>setModal(false)} wide>
-        <div style={{display:"flex",gap:10,marginBottom:10}}>
-          <select className="input" value={q.type} onChange={e=>setQ(p=>({...p,type:e.target.value}))} style={{flex:1}}>
-            {VALID_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
-          </select>
-          <select className="input" value={q.difficulty} onChange={e=>setQ(p=>({...p,difficulty:e.target.value}))} style={{flex:1}}>
-            {VALID_DIFF.map(d=><option key={d} value={d}>{d[0].toUpperCase()+d.slice(1)}</option>)}
-          </select>
-        </div>
-        <textarea className="input" placeholder="Question text…" value={q.question_text} onChange={e=>setQ(p=>({...p,question_text:e.target.value}))} rows={3} style={{marginBottom:10}}/>
-        <input className="input" placeholder="Answer…" value={q.answer} onChange={e=>setQ(p=>({...p,answer:e.target.value}))} style={{marginBottom:10}}/>
-        {["MCQ","MultiSelect"].includes(q.type)&&<input className="input" placeholder="Options (comma-separated)…" value={q.options} onChange={e=>setQ(p=>({...p,options:e.target.value}))} style={{marginBottom:10}}/>}
-        <textarea className="input" placeholder="Explanation (optional)…" value={q.explanation} onChange={e=>setQ(p=>({...p,explanation:e.target.value}))} rows={2} style={{marginBottom:14}}/>
-        <button className="btn btn-primary btn-lg" style={{width:"100%"}} onClick={create} disabled={!q.question_text.trim()||!q.answer.trim()}>Add Question</button>
-      </Modal>}
     </div>
   );
 }
@@ -3454,7 +3963,7 @@ function Sidebar({ screen, navigate, currentProfile, streak, due }) {
     <aside className="sidebar">
       <div style={{padding:"20px 14px 12px",borderBottom:"1px solid var(--border)"}}>
         <div style={{fontFamily:"var(--syne)",fontWeight:900,fontSize:17,letterSpacing:-.5}}>⚡ FlashMaster</div>
-        <div style={{fontSize:10,color:"var(--muted)",marginTop:2}}>v5.1 · Drive Sync</div>
+        <div style={{fontSize:10,color:"var(--muted)",marginTop:2}}>v6.0 · Drive Sync</div>
       </div>
 
       {/* Google user strip */}
