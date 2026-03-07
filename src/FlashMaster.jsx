@@ -138,6 +138,15 @@ const GDrive = {
     return r.json();
   },
 
+  async _driveDelete(path, token) {
+    const r = await fetch(`https://www.googleapis.com/drive/v3/${path}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!r.ok && r.status !== 404) throw new Error(`Drive DELETE ${path}: ${r.status}`);
+    return true;
+  },
+
   // ── User info ──────────────────────────────────────────────
   async getUserInfo(token) {
     const r = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
@@ -233,7 +242,31 @@ const GDrive = {
   async listProfileFiles(token, folderId) {
     const q = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
     const res = await this._driveGet(`files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=name`, token);
-    return (res.files || []).filter(f => f.name.startsWith("profile_"));
+    return (res.files || []).filter(f => /^profile_[^_].*\.json$/i.test(f.name));
+  },
+
+  async readJsonFile(clientId, filename) {
+    const token = await this.requestToken(clientId, false);
+    const folderId = await this.findOrCreateFolder(token);
+    const file = await this.findFile(token, folderId, filename);
+    if (!file) return null;
+    return { file, data: await this.downloadFile(token, file.id) };
+  },
+
+  async writeJsonFile(clientId, filename, data) {
+    const token = await this.requestToken(clientId, false);
+    const folderId = await this.findOrCreateFolder(token);
+    await this.uploadFile(token, folderId, filename, data);
+    return filename;
+  },
+
+  async deleteJsonFile(clientId, filename) {
+    const token = await this.requestToken(clientId, false);
+    const folderId = await this.findOrCreateFolder(token);
+    const file = await this.findFile(token, folderId, filename);
+    if (!file) return false;
+    await this._driveDelete(`files/${file.id}`, token);
+    return true;
   },
 
   // ── High-level sync ops ────────────────────────────────────
@@ -253,6 +286,31 @@ const GDrive = {
     const files    = await this.listProfileFiles(token, folderId);
     const results  = await Promise.all(
       files.map(f => this.downloadFile(token, f.id).then(d => ({ file: f, data: d })).catch(() => null))
+    );
+    return results.filter(Boolean);
+  },
+
+  async getProfileLock(clientId, profileId) {
+    return (await this.readJsonFile(clientId, `profile_lock_${profileId}.json`))?.data || null;
+  },
+
+  async putProfileLock(clientId, profileId, lockData) {
+    await this.writeJsonFile(clientId, `profile_lock_${profileId}.json`, lockData);
+    return profileId;
+  },
+
+  async deleteProfileLock(clientId, profileId) {
+    return this.deleteJsonFile(clientId, `profile_lock_${profileId}.json`);
+  },
+
+  async listProfileLocks(clientId) {
+    const token = await this.requestToken(clientId, false);
+    const folderId = await this.findOrCreateFolder(token);
+    const q = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
+    const res = await this._driveGet(`files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=name`, token);
+    const files = (res.files || []).filter(file => /^profile_lock_.*\.json$/i.test(file.name));
+    const results = await Promise.all(
+      files.map(file => this.downloadFile(token, file.id).then(data => ({ file, data })).catch(() => null))
     );
     return results.filter(Boolean);
   },
@@ -484,6 +542,17 @@ function buildProfileSyncData(data, profileId) {
     studySessions: data.studySessions ? data.studySessions.filter(session => session.uid === profileId) : [],
     reviewHistory: data.reviewHistory.filter(review => review.uid === profileId),
   };
+}
+
+async function replaceProfileSnapshots(data) {
+  const profileIds = (data?.profiles || []).map(profile => profile?.id).filter(Boolean);
+  if (!profileIds.length) return;
+
+  for (const profileId of profileIds) {
+    await DB.clearUserData(profileId);
+    await DB.deleteProfile(profileId);
+  }
+  await DB.importAll(data);
 }
 
 const SRS = {
@@ -1166,6 +1235,7 @@ function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
 // ══════════════════════════════════════════════════════════════
 const Speech = {
   _speakTimer: null,
+  _speakSeq: 0,
 
   _normalizeSpeakText(text) {
     const value = String(text || "").replace(/\s+/g, " ").trim();
@@ -1185,32 +1255,62 @@ const Speech = {
     return voices.find(voice => voice.lang?.toLowerCase().startsWith(base)) || null;
   },
 
+  _buildUtterance(text, lang, rate = 1, volume = 1) {
+    const u = new SpeechSynthesisUtterance(text);
+    const voice = this._pickVoice(lang);
+    u.lang = lang;
+    u.rate = rate;
+    u.volume = volume;
+    if (voice) u.voice = voice;
+    return u;
+  },
+
   speak(text, lang = "en-US", rate = 1, onEnd = null) {
     if (!window.speechSynthesis) return;
+    const synth = window.speechSynthesis;
+    const wasBusy = synth.speaking || synth.pending || synth.paused;
     const spokenText = this._normalizeSpeakText(text);
     if (!spokenText) { onEnd?.(); return; }
 
     this.cancel();
-    window.speechSynthesis.getVoices?.();
+    synth.getVoices?.();
 
-    this._speakTimer = window.setTimeout(() => {
-      const u = new SpeechSynthesisUtterance(spokenText);
-      const voice = this._pickVoice(lang);
-      u.lang = lang;
-      u.rate = rate;
-      if (voice) u.voice = voice;
-      u.onend = () => onEnd?.();
-      u.onerror = () => onEnd?.();
-      window.speechSynthesis.speak(u);
-      window.speechSynthesis.resume?.();
-      this._speakTimer = null;
-    }, 90);
+    const seq = ++this._speakSeq;
+    const queue = (fn, delay = 0) => {
+      this._speakTimer = window.setTimeout(() => {
+        this._speakTimer = null;
+        if (seq !== this._speakSeq) return;
+        fn();
+      }, delay);
+    };
+    const speakMain = () => {
+      const u = this._buildUtterance(spokenText, lang, rate, 1);
+      u.onend = () => { if (seq === this._speakSeq) onEnd?.(); };
+      u.onerror = () => { if (seq === this._speakSeq) onEnd?.(); };
+      synth.speak(u);
+      synth.resume?.();
+    };
+    const primeAndSpeak = () => {
+      const primer = this._buildUtterance("a", lang, Math.max(rate, 1), 0);
+      primer.onend = () => queue(speakMain, 10);
+      primer.onerror = () => queue(speakMain, 10);
+      synth.speak(primer);
+      synth.resume?.();
+    };
+
+    if (wasBusy) {
+      synth.cancel();
+      queue(primeAndSpeak, 140);
+      return;
+    }
+    queue(primeAndSpeak, 20);
   },
   cancel() {
     if (this._speakTimer) {
       clearTimeout(this._speakTimer);
       this._speakTimer = null;
     }
+    this._speakSeq += 1;
     window.speechSynthesis?.cancel();
   },
 
@@ -1297,6 +1397,52 @@ const Crypto = {
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
 const AVATARS = ["🦁","🐯","🦊","🐺","🦝","🐻","🐼","🦉","🦅","🦋","🐬","🦄","🦸","🧙","🧑‍🚀","🧑‍🎨"];
 
+const PROFILE_LOCK_TTL_MS = 45_000;
+const PROFILE_LOCK_HEARTBEAT_MS = 15_000;
+
+function getLocalDeviceId() {
+  try {
+    const existing = localStorage.getItem("fm_device_id");
+    if (existing) return existing;
+    const next = `dev_${uid()}`;
+    localStorage.setItem("fm_device_id", next);
+    return next;
+  } catch {
+    return `dev_${uid()}`;
+  }
+}
+
+function getLocalDeviceLabel() {
+  const nav = window.navigator || {};
+  const ua = String(nav.userAgent || "").toLowerCase();
+  const browser = ua.includes("edg/") ? "Edge"
+    : ua.includes("chrome/") ? "Chrome"
+    : ua.includes("firefox/") ? "Firefox"
+    : ua.includes("safari/") && !ua.includes("chrome/") ? "Safari"
+    : "Browser";
+  const platform = /android/i.test(ua) ? "Android"
+    : /iphone|ipad|ipod/i.test(ua) ? "iPhone"
+    : /win/i.test(String(nav.platform || "")) ? "Windows"
+    : /mac/i.test(String(nav.platform || "")) ? "Mac"
+    : /linux/i.test(String(nav.platform || "")) ? "Linux"
+    : "Device";
+  return `${browser} on ${platform}`;
+}
+
+function isProfileLockActive(lock) {
+  if (!lock?.updatedAt) return false;
+  const updatedAt = new Date(lock.updatedAt).getTime();
+  if (!Number.isFinite(updatedAt)) return false;
+  return Date.now() - updatedAt < PROFILE_LOCK_TTL_MS;
+}
+
+function getProfileLockLabel(lock) {
+  if (!lock) return "";
+  const owner = lock.deviceLabel || "another device";
+  if (!isProfileLockActive(lock)) return `Last active on ${owner}`;
+  return `Active on ${owner}`;
+}
+
 function shuffle(arr) {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -1355,14 +1501,20 @@ function AppProvider({ children }) {
     try { return JSON.parse(localStorage.getItem("fm_google_user") || "null"); } catch { return null; }
   });
   const googleClientId = GOOGLE_CLIENT_ID;
+  const deviceId = useMemo(() => getLocalDeviceId(), []);
+  const deviceLabel = useMemo(() => getLocalDeviceLabel(), []);
   const [gdriveSyncing, setGdriveSyncing] = useState(false);
   const [gdriveStatus,  setGdriveStatus]  = useState("");
   const [googleAuthChecking, setGoogleAuthChecking] = useState(false);
+  const [profileLocks, setProfileLocks] = useState({});
   const [lastSyncedAt,  setLastSyncedAt]  = useState(() =>
     localStorage.getItem("fm_last_synced") || ""
   );
   // Debounce ref for continuous auto-sync
   const autoSyncTimer = useRef(null);
+  const cloudPullPromise = useRef(null);
+  const profileLockBeatRef = useRef(null);
+  const activeProfileLockRef = useRef(null);
   const [settings,    setSettings]    = useState(() => {
     try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem("fm_settings") || "{}") }; }
     catch { return DEFAULT_SETTINGS; }
@@ -1766,18 +1918,138 @@ function AppProvider({ children }) {
     ]);
     setProfiles(p); setSubjects(allS); setTopics(allT); setSubtopics(allST);
     setQuestions(allQ); setFlashProg(allFP); setQA(allQA); setLB(allLB); setRH(allRH);
+    setCP(prev => prev ? p.find(profile => profile.id === prev.id) || null : prev);
   }, []);
 
-  const restoreDriveProfiles = useCallback(async (statusMessage = "Downloading your profiles from Drive…") => {
-    setGdriveStatus(statusMessage);
-    const results = await GDrive.syncAllDown(googleClientId);
-    if (!results.length) return 0;
-
-    for (const { data } of results) {
-      if (data?.profiles?.length) await DB.importAll(data);
+  const refreshProfileLocks = useCallback(async () => {
+    if (!googleUser || !googleClientId) return {};
+    try {
+      const locks = await GDrive.listProfileLocks(googleClientId);
+      const next = Object.fromEntries(
+        locks
+          .map(({ data }) => [data?.profileId, data])
+          .filter(([profileId, data]) => profileId && data)
+      );
+      setProfileLocks(next);
+      return next;
+    } catch (e) {
+      console.warn("[FM6] Refresh profile locks failed:", e.message);
+      return {};
     }
-    await reloadCloudData();
-    return results.length;
+  }, [googleClientId, googleUser]);
+
+  const writeProfileLock = useCallback(async profileId => {
+    if (!googleUser || !googleClientId || !profileId) return null;
+    const lock = {
+      profileId,
+      deviceId,
+      deviceLabel,
+      googleEmail: googleUser.email || "",
+      updatedAt: new Date().toISOString(),
+    };
+    await GDrive.putProfileLock(googleClientId, profileId, lock);
+    activeProfileLockRef.current = lock;
+    setProfileLocks(prev => ({ ...prev, [profileId]: lock }));
+    return lock;
+  }, [deviceId, deviceLabel, googleClientId, googleUser]);
+
+  const stopProfileLockHeartbeat = useCallback(() => {
+    if (profileLockBeatRef.current) {
+      clearInterval(profileLockBeatRef.current);
+      profileLockBeatRef.current = null;
+    }
+  }, []);
+
+  const startProfileLockHeartbeat = useCallback(profileId => {
+    stopProfileLockHeartbeat();
+    profileLockBeatRef.current = window.setInterval(() => {
+      writeProfileLock(profileId).catch(e => {
+        console.warn("[FM6] Profile lock heartbeat failed:", e.message);
+      });
+    }, PROFILE_LOCK_HEARTBEAT_MS);
+  }, [stopProfileLockHeartbeat, writeProfileLock]);
+
+  useEffect(() => () => stopProfileLockHeartbeat(), [stopProfileLockHeartbeat]);
+
+  const releaseProfileLock = useCallback(async (profileId = activeProfileLockRef.current?.profileId) => {
+    stopProfileLockHeartbeat();
+    if (!googleClientId || !profileId) {
+      activeProfileLockRef.current = null;
+      return;
+    }
+
+    try {
+      const remoteLock = await GDrive.getProfileLock(googleClientId, profileId);
+      if (!remoteLock || remoteLock.deviceId === deviceId || !isProfileLockActive(remoteLock)) {
+        await GDrive.deleteProfileLock(googleClientId, profileId);
+      }
+    } catch (e) {
+      console.warn("[FM6] Release profile lock failed:", e.message);
+    } finally {
+      activeProfileLockRef.current = null;
+      setProfileLocks(prev => {
+        const next = { ...prev };
+        const lock = next[profileId];
+        if (!lock || lock.deviceId === deviceId || !isProfileLockActive(lock)) delete next[profileId];
+        return next;
+      });
+    }
+  }, [deviceId, googleClientId, stopProfileLockHeartbeat]);
+
+  const enterProfile = useCallback(async profile => {
+    if (!profile) return false;
+    if (!googleUser || !googleClientId) {
+      showToast("Sign in to Google first!", "error");
+      return false;
+    }
+
+    try {
+      const remoteLock = await GDrive.getProfileLock(googleClientId, profile.id);
+      if (remoteLock && isProfileLockActive(remoteLock) && remoteLock.deviceId !== deviceId) {
+        setProfileLocks(prev => ({ ...prev, [profile.id]: remoteLock }));
+        showToast(`${profile.name} is active on another device`, "error");
+        return false;
+      }
+      await writeProfileLock(profile.id);
+      startProfileLockHeartbeat(profile.id);
+      setCP(profile);
+      navigate("dashboard");
+      return true;
+    } catch (e) {
+      console.error("[FM6] Profile lock error:", e);
+      showToast("Could not lock profile: " + e.message, "error");
+      return false;
+    }
+  }, [deviceId, googleClientId, googleUser, navigate, showToast, startProfileLockHeartbeat, writeProfileLock]);
+
+  const restoreDriveProfiles = useCallback(async (
+    statusMessage = "Downloading your profiles from Drive…",
+    mode = "replace",
+  ) => {
+    if (cloudPullPromise.current) return cloudPullPromise.current;
+
+    const work = (async () => {
+      if (statusMessage) setGdriveStatus(statusMessage);
+      const results = await GDrive.syncAllDown(googleClientId);
+      if (!results.length) return 0;
+
+      let imported = 0;
+      for (const { data } of results) {
+        if (!data?.profiles?.length) continue;
+        if (mode === "replace") await replaceProfileSnapshots(data);
+        else await DB.importAll(data);
+        imported += data.profiles.length;
+      }
+      await reloadCloudData();
+      return imported;
+    })();
+
+    cloudPullPromise.current = work;
+    try {
+      return await work;
+    } finally {
+      cloudPullPromise.current = null;
+    }
   }, [googleClientId, reloadCloudData]);
 
   const completeGoogleSession = useCallback(async (token, options = {}) => {
@@ -1794,16 +2066,17 @@ function AppProvider({ children }) {
 
     if (restoreProfiles) {
       try {
-        await restoreDriveProfiles();
+        await restoreDriveProfiles("Downloading your profiles from Drive…", "replace");
       } catch (e) {
         console.warn("[FM6] Drive pull on login:", e.message);
       }
     }
 
+    await refreshProfileLocks();
     setGdriveStatus("");
     setScreen("profiles");
     return user;
-  }, [restoreDriveProfiles]);
+  }, [refreshProfileLocks, restoreDriveProfiles]);
 
   const checkGoogleSignInStatus = useCallback(async () => {
     if (!googleClientId.trim()) return false;
@@ -1816,8 +2089,11 @@ function AppProvider({ children }) {
       return true;
     } catch (e) {
       console.warn("[FM6] Silent Google session check failed:", e.message);
+      stopProfileLockHeartbeat();
+      activeProfileLockRef.current = null;
       GDrive.revokeToken();
       setGoogleUser(null);
+      setProfileLocks({});
       localStorage.removeItem("fm_google_user");
       setGdriveStatus("");
       setScreen("google_login");
@@ -1825,7 +2101,7 @@ function AppProvider({ children }) {
     } finally {
       setGoogleAuthChecking(false);
     }
-  }, [completeGoogleSession, googleClientId]);
+  }, [completeGoogleSession, googleClientId, stopProfileLockHeartbeat]);
 
   async function googleSignIn() {
     if (!googleClientId.trim()) {
@@ -1848,10 +2124,12 @@ function AppProvider({ children }) {
     }
   }
 
-  function googleSignOut(silent = false) {
+  async function googleSignOut(silent = false) {
+    await releaseProfileLock(currentProfile?.id);
     GDrive.revokeToken();
     setGoogleUser(null);
     setGoogleAuthChecking(false);
+    setProfileLocks({});
     localStorage.removeItem("fm_google_user");
     setCP(null);
     setGdriveStatus("");
@@ -1860,6 +2138,7 @@ function AppProvider({ children }) {
   }
 
   async function googleSwitchAccount() {
+    await releaseProfileLock(currentProfile?.id);
     GDrive.revokeToken();
     return googleSignIn();
   }
@@ -1895,6 +2174,66 @@ function AppProvider({ children }) {
   ]);
 
   // ── Google Drive: manual push (for Settings panel) ────────
+  useEffect(() => {
+    if (!googleUser || !googleClientId) return;
+
+    const pullLatest = () => {
+      if (document.visibilityState === "hidden") return;
+      restoreDriveProfiles("", "merge").catch(e => {
+        console.warn("[FM6] Background Drive pull failed:", e.message);
+      });
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") pullLatest();
+    };
+
+    pullLatest();
+    const intervalId = window.setInterval(pullLatest, 30000);
+    window.addEventListener("focus", pullLatest);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(intervalId);
+      window.removeEventListener("focus", pullLatest);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [googleUser, googleClientId, restoreDriveProfiles]);
+
+  useEffect(() => {
+    if (!googleUser || !googleClientId) return;
+
+    const refreshLocks = () => {
+      if (document.visibilityState === "hidden") return;
+      refreshProfileLocks().catch(e => {
+        console.warn("[FM6] Background lock refresh failed:", e.message);
+      });
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refreshLocks();
+    };
+
+    refreshLocks();
+    const intervalId = window.setInterval(refreshLocks, PROFILE_LOCK_HEARTBEAT_MS);
+    window.addEventListener("focus", refreshLocks);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(intervalId);
+      window.removeEventListener("focus", refreshLocks);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [googleUser, googleClientId, refreshProfileLocks]);
+
+  useEffect(() => {
+    if (!currentProfile) return;
+    const lock = profileLocks[currentProfile.id];
+    if (!lock || !isProfileLockActive(lock) || lock.deviceId === deviceId) return;
+
+    stopProfileLockHeartbeat();
+    activeProfileLockRef.current = null;
+    setCP(null);
+    navigate("profiles");
+    showToast(`${currentProfile.name} is active on another device`, "error");
+  }, [currentProfile, deviceId, navigate, profileLocks, showToast, stopProfileLockHeartbeat]);
+
   async function syncProfileToDrive() {
     if (!googleUser) { showToast("Sign in to Google first!", "error"); return; }
     if (!googleClientId) { showToast("Google OAuth is not configured", "error"); return; }
@@ -1927,22 +2266,9 @@ function AppProvider({ children }) {
     setGdriveSyncing(true);
     setGdriveStatus("Downloading from Drive…");
     try {
-      const results = await GDrive.syncAllDown(googleClientId);
-      if (!results.length) { showToast("No profile backups found in Drive", "info"); setGdriveSyncing(false); setGdriveStatus(""); return; }
-      let imported = 0;
-      for (const { data } of results) {
-        if (!data?.profiles?.length) continue;
-        await DB.importAll(data);
-        imported += data.profiles.length;
-      }
-      const db = await getDB();
-      const [p, allS, allT, allST, allQ, allFP, allQA, allLB, allRH] = await Promise.all([
-        db.profiles.toArray(), db.subjects.toArray(), db.topics.toArray(),
-        db.subtopics.toArray(), db.questions.toArray(), db.flashProgress.toArray(),
-        db.quizAttempts.toArray(), db.leaderboard.toArray(), db.reviewHistory.toArray(),
-      ]);
-      setProfiles(p); setSubjects(allS); setTopics(allT); setSubtopics(allST);
-      setQuestions(allQ); setFlashProg(allFP); setQA(allQA); setLB(allLB); setRH(allRH);
+      await releaseProfileLock(currentProfile?.id);
+      const imported = await restoreDriveProfiles("Downloading from Drive…", "replace");
+      if (!imported) { showToast("No profile backups found in Drive", "info"); setGdriveStatus(""); return; }
       setCP(null); navigate("profiles");
       setGdriveStatus(`✅ Restored ${imported} profile(s) from Drive`);
       showToast(`Restored ${imported} profile(s) from Drive! ✅`);
@@ -2030,7 +2356,9 @@ function AppProvider({ children }) {
     getAccuracy, getWeakLessons, selectAdaptive, getTodayDP, showToast,
     // Google / Drive
     googleUser, googleClientId, googleAuthChecking, gdriveSyncing, gdriveStatus, lastSyncedAt,
+    deviceId, deviceLabel, profileLocks,
     googleSignIn, googleSignOut, googleSwitchAccount, checkGoogleSignInStatus,
+    enterProfile,
     syncProfileToDrive, restoreFromDrive,
     SRS, ReviewQueue, CSV, Speech, Crypto,
   };
@@ -3659,18 +3987,25 @@ function LeaderboardScreen() {
 // §21  CONTENT SCREENS — Profiles, Subjects, Topics, Subtopics, Questions
 // ══════════════════════════════════════════════════════════════
 function ProfilesScreen() {
-  const { profiles, createProfile, deleteProfile, setCurrentProfile, navigate,
+  const { profiles, createProfile, deleteProfile, enterProfile, profileLocks, deviceId,
           googleUser, gdriveStatus, googleSwitchAccount } = useApp();
   const [modal,  setModal]  = useState(false);
   const [name,   setName]   = useState("");
   const [avatar, setAvatar] = useState(AVATARS[0]);
   const [switchingGoogle, setSwitchingGoogle] = useState(false);
+  const [openingProfileId, setOpeningProfileId] = useState("");
 
   async function create() {
     if (!name.trim()) return;
     const p = await createProfile(name.trim(), avatar);
-    setCurrentProfile(p);
-    navigate("dashboard");
+    setModal(false);
+    setName("");
+    setOpeningProfileId(p.id);
+    try {
+      await enterProfile(p);
+    } finally {
+      setOpeningProfileId("");
+    }
   }
 
   async function handleSwitchGoogleAccount() {
@@ -3679,6 +4014,15 @@ function ProfilesScreen() {
       await googleSwitchAccount();
     } finally {
       setSwitchingGoogle(false);
+    }
+  }
+
+  async function handleOpenProfile(profile) {
+    setOpeningProfileId(profile.id);
+    try {
+      await enterProfile(profile);
+    } finally {
+      setOpeningProfileId("");
     }
   }
 
@@ -3735,12 +4079,18 @@ function ProfilesScreen() {
             <div style={{marginBottom:14}}>
               {profiles.map(p=>(
                 <div key={p.id} className="card"
-                  style={{display:"flex",alignItems:"center",gap:14,padding:"16px 18px",marginBottom:10,cursor:"pointer"}}
-                  onClick={()=>{setCurrentProfile(p);navigate("dashboard");}}>
+                  style={{display:"flex",alignItems:"center",gap:14,padding:"16px 18px",marginBottom:10,cursor:profileLocks[p.id] && isProfileLockActive(profileLocks[p.id]) && profileLocks[p.id].deviceId !== deviceId ? "not-allowed" : "pointer",opacity:profileLocks[p.id] && isProfileLockActive(profileLocks[p.id]) && profileLocks[p.id].deviceId !== deviceId ? 0.7 : 1}}
+                  onClick={() => {
+                    const lock = profileLocks[p.id];
+                    const blocked = lock && isProfileLockActive(lock) && lock.deviceId !== deviceId;
+                    if (!blocked && openingProfileId !== p.id) handleOpenProfile(p);
+                  }}>
                   <div style={{fontSize:34}}>{p.avatar}</div>
                   <div style={{flex:1}}>
                     <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:17}}>{p.name}</div>
-                    <div style={{fontSize:12,color:"var(--muted)"}}>Tap to enter</div>
+                    <div style={{fontSize:12,color:profileLocks[p.id] && isProfileLockActive(profileLocks[p.id]) && profileLocks[p.id].deviceId !== deviceId ? "var(--red)" : "var(--muted)"}}>
+                      {openingProfileId === p.id ? "Opening profile..." : profileLocks[p.id] && isProfileLockActive(profileLocks[p.id]) && profileLocks[p.id].deviceId !== deviceId ? getProfileLockLabel(profileLocks[p.id]) : "Tap to enter"}
+                    </div>
                   </div>
                   <button className="btn btn-ghost btn-sm"
                     onClick={e=>{e.stopPropagation();if(confirm(`Delete "${p.name}"?`))deleteProfile(p.id);}}>🗑</button>
