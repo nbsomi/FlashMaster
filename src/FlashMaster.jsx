@@ -2965,7 +2965,7 @@ function LeaderboardScreen() {
 // ══════════════════════════════════════════════════════════════
 function ProfilesScreen() {
   const { profiles, createProfile, deleteProfile, setCurrentProfile, navigate,
-          googleUser, gdriveSyncing, gdriveStatus, restoreFromDrive, googleSwitchAccount } = useApp();
+          googleUser, gdriveStatus, googleSwitchAccount } = useApp();
   const [modal,  setModal]  = useState(false);
   const [name,   setName]   = useState("");
   const [avatar, setAvatar] = useState(AVATARS[0]);
@@ -3033,14 +3033,7 @@ function ProfilesScreen() {
             icon="👤"
             title="No profiles yet"
             sub="Create your first profile to start learning"
-            action={
-              <div style={{display:"flex",flexDirection:"column",gap:10,width:"100%"}}>
-                <button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Create Profile</button>
-                <button className="btn btn-ghost btn-sm" onClick={restoreFromDrive} disabled={gdriveSyncing}>
-                  {gdriveSyncing?"⏳ Loading…":"☁️ Restore profiles from Drive"}
-                </button>
-              </div>
-            }
+            action={<button className="btn btn-primary btn-lg" onClick={()=>setModal(true)}>+ Create Profile</button>}
           />
         ) : (
           <>
@@ -3062,9 +3055,6 @@ function ProfilesScreen() {
             </div>
             <div style={{display:"flex",gap:10}}>
               <button className="btn btn-primary btn-lg" style={{flex:1}} onClick={()=>setModal(true)}>+ New Profile</button>
-              <button className="btn btn-ghost btn-sm" onClick={restoreFromDrive} disabled={gdriveSyncing} title="Pull from Drive">
-                {gdriveSyncing?"⏳":"☁️"}
-              </button>
             </div>
           </>
         )}
