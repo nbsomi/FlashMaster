@@ -2739,18 +2739,35 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
 
   async function handleFile(file) {
     setFilename(file.name);
-    const text = await file.text();
-    const result = CSV.parse(text);
-    if (result.errors.length) { setError(result.errors.join("; ")); return; }
-    setParsed(result);
-    setTopic(file.name.replace(/\.csv$/i,"").replace(/[_-]/g," ").trim());
-    setStep("preview");
+    setError("");
+    setParsed(null);
+
+    try {
+      const text = await file.text();
+      const result = CSV.parse(text);
+      if (result.errors.length) {
+        setError(result.errors.join("; "));
+        return;
+      }
+      setParsed(result);
+      setTopic(file.name.replace(/\.csv$/i,"").replace(/[_-]/g," ").trim());
+      setStep("preview");
+    } catch (e) {
+      console.error("CSV file read/parse failed:", e);
+      setError(e?.message || String(e));
+    }
   }
 
   async function doImport() {
     setStep("importing");
-    await onImport(subjectId, topicName, parsed.rows);
-    setStep("done");
+    try {
+      await onImport(subjectId, topicName, parsed.rows);
+      setStep("done");
+    } catch (e) {
+      console.error("CSV import failed:", e);
+      setError(e?.message || String(e));
+      setStep("preview");
+    }
   }
 
   return (
@@ -3671,9 +3688,14 @@ function SubjectsScreen() {
   async function create() { if(!name.trim())return; await createSubject(name.trim()); setName(""); setModal(false); }
 
   async function handleImport(sid, topicName, rows) {
-    const r = await importCSVToSubject(sid, topicName, rows);
-    setLog(`✅ "${r.topicName}" · ${r.subtopicCount} subtopics · ${r.questionCount} questions`);
-    setTimeout(()=>setLog(""),8000);
+    try {
+      const r = await importCSVToSubject(sid, topicName, rows);
+      setLog(`✅ "${r.topicName}" · ${r.subtopicCount} subtopics · ${r.questionCount} questions`);
+      setTimeout(()=>setLog(""),8000);
+    } catch (e) {
+      console.error("CSV import failed:", e);
+      showToast(`CSV import failed: ${e?.message||e}`, "error");
+    }
   }
 
   return (
