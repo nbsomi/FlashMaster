@@ -71,8 +71,12 @@ async function loadGIS() {
 // §1c  GOOGLE DRIVE ENGINE
 // ══════════════════════════════════════════════════════════════
 const GDrive = {
-  _accessToken : null,
-  _tokenExpiry : 0,
+  _accessToken    : null,
+  _tokenExpiry    : 0,
+  _tokenClient    : null,     // single GIS client per clientId (never recreated)
+  _tokenClientId  : null,
+  _tokenResolvers : [],       // dispatch queue: all concurrent waiters for a token
+  _pendingToken   : null,     // shared in-flight promise (deduplicates ALL callers)
   FOLDER_NAME  : "FlashMaster",
   SCOPES       : [
     "https://www.googleapis.com/auth/drive.file",
@@ -82,31 +86,87 @@ const GDrive = {
 
   // ── Token management ───────────────────────────────────────
   async requestToken(clientId, interactive = true) {
+    // Return cached token if still valid (60-second buffer)
     if (this._accessToken && Date.now() < this._tokenExpiry - 60_000) {
       return this._accessToken;
     }
+
+    // Deduplicate: ALL concurrent callers share one in-flight promise.
+    // This prevents multiple GIS popup windows and hanging promises from
+    // concurrent requestAccessToken calls stomping each other's callbacks.
+    if (this._pendingToken) return this._pendingToken;
+
     const accounts = await loadGIS();
-    return new Promise((resolve, reject) => {
-      const tc = accounts.oauth2.initTokenClient({
+
+    // Create the GIS tokenClient ONCE per clientId.
+    // GIS's token client uses a persistent dispatch callback; every
+    // requestAccessToken call fires that same callback.  We route responses
+    // to the correct per-call resolver via a resolver queue.
+    if (!this._tokenClient || this._tokenClientId !== clientId) {
+      this._tokenResolvers = [];
+      this._tokenClient = accounts.oauth2.initTokenClient({
         client_id : clientId,
         scope     : this.SCOPES,
         callback  : resp => {
-          if (resp.error) { reject(new Error(resp.error)); return; }
+          // Drain the queue — one entry per requestAccessToken call
+          const pending = this._tokenResolvers.splice(0, 1)[0];
+          if (!pending) return;
+          if (resp.error) { pending.reject(new Error(resp.error)); return; }
           this._accessToken = resp.access_token;
           this._tokenExpiry = Date.now() + resp.expires_in * 1000;
-          resolve(resp.access_token);
+          pending.resolve(resp.access_token);
         },
       });
-      tc.requestAccessToken({ prompt: interactive ? "" : "none" });
+      this._tokenClientId = clientId;
+    }
+
+    const doRequest = (prompt) => new Promise((resolve, reject) => {
+      this._tokenResolvers.push({ resolve, reject });
+      this._tokenClient.requestAccessToken({ prompt });
     });
+
+    this._pendingToken = (async () => {
+      try {
+        if (!interactive) {
+          // Silent only — never shows a popup
+          return await doRequest("none");
+        }
+        // Two-stage interactive:
+        //  1. Try prompt:"none" first — succeeds silently when the browser
+        //     still holds a valid Google session (very common case).
+        //  2. Fall back to prompt:"select_account" — reliably shows the
+        //     account picker.  Avoids the loop caused by prompt:"" when
+        //     FedCM/third-party cookies are blocked (Safari/Firefox ETP).
+        try {
+          return await doRequest("none");
+        } catch {
+          return await doRequest("select_account");
+        }
+      } finally {
+        this._pendingToken = null;
+      }
+    })();
+
+    return this._pendingToken;
   },
 
   revokeToken() {
     if (this._accessToken && window.google?.accounts?.oauth2) {
       window.google.accounts.oauth2.revoke(this._accessToken, () => {});
     }
-    this._accessToken = null;
-    this._tokenExpiry = 0;
+    this._accessToken  = null;
+    this._tokenExpiry  = 0;
+    this._pendingToken = null;
+    this._tokenResolvers = [];
+    // Keep _tokenClient cached — revoke doesn't invalidate the client itself
+  },
+
+  /** Returns true only when we already hold a non-expired access token.
+   *  Does NOT attempt a silent refresh.  Use this to gate background ops
+   *  so we never create spurious GIS token-client instances that cause
+   *  the consent popup to appear unexpectedly. */
+  hasValidToken() {
+    return !!(this._accessToken && Date.now() < this._tokenExpiry - 60_000);
   },
 
   // ── Drive REST helpers ─────────────────────────────────────
@@ -2050,6 +2110,15 @@ function AppProvider({ children }) {
       return false;
     }
 
+    // If the GIS token is expired we cannot reach Drive for lock checks, but the
+    // user is still identified by their cached Google account and should not be
+    // locked out of their own data.  Skip lock ops gracefully and proceed.
+    if (!GDrive.hasValidToken()) {
+      setCP(profile);
+      navigate("dashboard");
+      return true;
+    }
+
     try {
       const remoteLock = await GDrive.getProfileLock(googleClientId, profile.id);
       if (remoteLock && isProfileLockActive(remoteLock) && remoteLock.deviceId !== deviceId) {
@@ -2064,6 +2133,12 @@ function AppProvider({ children }) {
       return true;
     } catch (e) {
       console.error("[FM6] Profile lock error:", e);
+      // Token expired mid-flight — still let the user in; sync will recover.
+      if (/access_denied|token|401|403/i.test(e.message)) {
+        setCP(profile);
+        navigate("dashboard");
+        return true;
+      }
       showToast("Could not lock profile: " + e.message, "error");
       return false;
     }
@@ -2216,6 +2291,12 @@ function AppProvider({ children }) {
     if (!googleUser || !googleClientId || !uid_) return;
     if (autoSyncTimer.current) clearTimeout(autoSyncTimer.current);
     autoSyncTimer.current = setTimeout(async () => {
+      // Abort silently if the access token has expired.  The user will need to
+      // re-authenticate (via the ☁️ button) before background sync resumes.
+      if (!GDrive.hasValidToken()) {
+        setGdriveSyncing(false);
+        return;
+      }
       try {
         setGdriveSyncing(true);
         setGdriveStatus("⏳ Syncing…");
@@ -2251,7 +2332,10 @@ function AppProvider({ children }) {
     if (!googleUser || !googleClientId) return;
 
     const pullLatest = () => {
-      if (document.visibilityState === "hidden") return;
+      // Never attempt a Drive pull when the access token is expired — doing so
+      // creates a new GIS token-client instance that can surface the consent
+      // popup unexpectedly ("looping signin").
+      if (document.visibilityState === "hidden" || !GDrive.hasValidToken()) return;
       restoreDriveProfiles("", "merge").catch(e => {
         console.warn("[FM6] Background Drive pull failed:", e.message);
       });
@@ -2275,7 +2359,8 @@ function AppProvider({ children }) {
     if (!googleUser || !googleClientId) return;
 
     const refreshLocks = () => {
-      if (document.visibilityState === "hidden") return;
+      // Same guard — skip when token is expired.
+      if (document.visibilityState === "hidden" || !GDrive.hasValidToken()) return;
       refreshProfileLocks().catch(e => {
         console.warn("[FM6] Background lock refresh failed:", e.message);
       });
@@ -4063,12 +4148,24 @@ function LeaderboardScreen() {
 // ══════════════════════════════════════════════════════════════
 function ProfilesScreen() {
   const { profiles, createProfile, deleteProfile, enterProfile, profileLocks, deviceId,
-          googleUser, gdriveStatus, googleSwitchAccount } = useApp();
+          googleUser, gdriveStatus, googleSwitchAccount, googleSignIn } = useApp();
   const [modal,  setModal]  = useState(false);
   const [name,   setName]   = useState("");
   const [avatar, setAvatar] = useState(AVATARS[0]);
   const [switchingGoogle, setSwitchingGoogle] = useState(false);
+  const [reauthing, setReauthing] = useState(false);
   const [openingProfileId, setOpeningProfileId] = useState("");
+
+  const drivePaused = gdriveStatus?.startsWith("⚠️");
+
+  async function handleReauth() {
+    setReauthing(true);
+    try {
+      await googleSignIn();
+    } finally {
+      setReauthing(false);
+    }
+  }
 
   async function create() {
     if (!name.trim()) return;
@@ -4128,7 +4225,17 @@ function ProfilesScreen() {
             </div>
           )}
           </div>
-          <div style={{marginTop:12}}>
+          <div style={{marginTop:12,display:"flex",gap:8,flexDirection:"column"}}>
+            {drivePaused && (
+              <button
+                className="btn btn-primary btn-sm"
+                style={{width:"100%"}}
+                onClick={handleReauth}
+                disabled={reauthing}
+              >
+                {reauthing ? "Opening Google sign-in…" : "🔄 Re-authenticate Google Drive"}
+              </button>
+            )}
             <button
               className="btn btn-ghost btn-sm"
               style={{width:"100%"}}
