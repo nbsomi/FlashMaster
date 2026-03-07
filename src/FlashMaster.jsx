@@ -643,13 +643,40 @@ function splitOptionValues(options = "") {
   return String(options || "").split(",").map(value => value.trim()).filter(Boolean);
 }
 
+function normalizeMediaUrl(media = "") {
+  const raw = String(media || "").trim();
+  if (!raw || /^data:|^blob:/i.test(raw)) return raw;
+
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+
+    if (host.includes("drive.google.com")) {
+      const fileMatch = url.pathname.match(/\/file\/d\/([^/]+)/i);
+      const fileId = fileMatch?.[1] || url.searchParams.get("id");
+      if (fileId) return `https://drive.google.com/uc?export=view&id=${fileId}`;
+    }
+
+    if (host === "dropbox.com" || host === "www.dropbox.com") {
+      url.searchParams.delete("dl");
+      url.searchParams.set("raw", "1");
+      return url.toString();
+    }
+  } catch {
+    return raw;
+  }
+
+  return raw;
+}
+
 function detectMediaKind(media = "") {
-  const value = String(media || "").trim().toLowerCase();
+  const value = normalizeMediaUrl(media).toLowerCase();
   if (!value) return "";
   if (value.startsWith("data:image/")) return "image";
   if (value.startsWith("data:audio/")) return "audio";
   if (IMAGE_FILE_RE.test(value)) return "image";
   if (AUDIO_FILE_RE.test(value)) return "audio";
+  if (/^https?:\/\//.test(value) || value.startsWith("/")) return "image";
   return "";
 }
 
@@ -729,8 +756,10 @@ const CSV = {
     return String(header)
       .replace(/^\uFEFF/, "")
       .trim()
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
       .toLowerCase()
-      .replace(/[\s-]+/g, "_");
+      .replace(/[\s-]+/g, "_")
+      .replace(/_+/g, "_");
   },
 
   parseTable(text) {
@@ -807,7 +836,7 @@ const CSV = {
     const idx = name => headers.indexOf(name);
     const qCol = [idx("question_text"), idx("question"), idx("q")].find(i => i >= 0);
     const aCol = [idx("answer"), idx("a")].find(i => i >= 0);
-    const mediaCol = [idx("media"), idx("media_url"), idx("image_url")].find(i => i >= 0);
+    const mediaCol = [idx("media"), idx("media_url"), idx("mediaurl"), idx("image_url"), idx("imageurl")].find(i => i >= 0);
     const optionsCol = [idx("options"), idx("choices"), idx("items"), idx("pairs")].find(i => i >= 0);
     const answerTypeCols = headers.map((header, index) =>
       header.startsWith("answer_") ? { key: header.slice(7), index } : null
@@ -824,7 +853,7 @@ const CSV = {
 
       const rawType = get(idx("type"));
       const rawDiff = (get(idx("difficulty")) || get(idx("diff")) || "medium").toLowerCase();
-      const media = get(mediaCol);
+      const media = normalizeMediaUrl(get(mediaCol));
       const options = get(optionsCol);
       const normalizedCsvType = String(rawType || "").trim().toLowerCase();
       const diff = VALID_DIFF.includes(rawDiff) ? rawDiff : "medium";
@@ -1067,21 +1096,43 @@ function getAnswerPlaceholder(type, answerTypeLabel = "") {
 }
 
 function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
+  const mediaSrc = normalizeMediaUrl(question?.media);
+  const [mediaError, setMediaError] = useState(false);
+
+  useEffect(() => {
+    setMediaError(false);
+  }, [mediaSrc]);
+
   if (isImageQuestion(question)) {
-    if (!question?.media) return null;
+    if (!mediaSrc) return null;
+    if (mediaError) {
+      return (
+        <div style={{ width:"100%" }}>
+          <div style={{ background:"var(--accent)10", border:"1px solid var(--accent)30", borderRadius:10, padding:"10px 12px", marginBottom, fontSize:12, color:"var(--accent)" }}>
+            Image could not be loaded from this URL.
+            <div style={{ marginTop:6 }}>
+              <a href={mediaSrc} target="_blank" rel="noreferrer" style={{ color:"inherit", textDecoration:"underline" }} onClick={e => e.stopPropagation()}>
+                Open image directly
+              </a>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div style={{ width:"100%" }}>
         <img
-          src={question.media}
+          src={mediaSrc}
           alt="Question prompt"
+          referrerPolicy="no-referrer"
           style={{ maxWidth:"100%", maxHeight, borderRadius:10, marginBottom, objectFit:"contain", display:"block" }}
-          onError={e => { e.currentTarget.style.display = "none"; }}
+          onError={() => setMediaError(true)}
         />
       </div>
     );
   }
   if (normalizeQuestionType(question) === "Audio") {
-    return <audio controls src={question.media} style={{ width:"100%", marginBottom }} onClick={e => e.stopPropagation()} />;
+    return <audio controls src={mediaSrc} style={{ width:"100%", marginBottom }} onClick={e => e.stopPropagation()} />;
   }
   return null;
 }
