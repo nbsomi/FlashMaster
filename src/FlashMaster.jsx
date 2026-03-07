@@ -31,13 +31,7 @@ import {
 const GOOGLE_CLIENT_ID = (import.meta.env.VITE_GOOGLE_CLIENT_ID || "").trim();
 const GOOGLE_IMAGE_SEARCH_API_KEY = (import.meta.env.VITE_GOOGLE_IMAGE_SEARCH_API_KEY || "").trim();
 const GOOGLE_IMAGE_SEARCH_CX = (import.meta.env.VITE_GOOGLE_IMAGE_SEARCH_CX || "").trim();
-const CLOUDFLARE_ACCOUNT_ID = (import.meta.env.VITE_CLOUDFLARE_ACCOUNT_ID || "").trim();
-const CLOUDFLARE_API_TOKEN = (import.meta.env.VITE_CLOUDFLARE_API_TOKEN || "").trim();
-const CLOUDFLARE_IMAGE_MODEL = (import.meta.env.VITE_CLOUDFLARE_IMAGE_MODEL || "@cf/bytedance/stable-diffusion-xl-lightning").trim();
 const GOOGLE_IMAGE_SEARCH_ENABLED = !!(GOOGLE_IMAGE_SEARCH_API_KEY && GOOGLE_IMAGE_SEARCH_CX);
-const CLOUDFLARE_IMAGE_ENABLED = !!(CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN);
-const GENERATED_IMAGE_CACHE = new Map();
-const GENERATED_IMAGE_PENDING = new Map();
 const GOOGLE_IMAGE_CACHE = new Map();
 const GOOGLE_IMAGE_PENDING = new Map();
 
@@ -648,36 +642,6 @@ function hashString(input = "") {
   return hash;
 }
 
-function escapeSvgText(text = "") {
-  return String(text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function splitPromptLines(text, maxChars = 22, maxLines = 3) {
-  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
-  if (!words.length) return ["Image prompt"];
-  const lines = [];
-  let current = "";
-  for (const word of words) {
-    const next = current ? `${current} ${word}` : word;
-    if (next.length > maxChars && current) {
-      lines.push(current);
-      current = word;
-      if (lines.length === maxLines - 1) break;
-    } else {
-      current = next;
-    }
-  }
-  if (lines.length < maxLines && current) lines.push(current);
-  const usedWords = lines.join(" ").split(/\s+/).filter(Boolean).length;
-  if (usedWords < words.length) lines[lines.length - 1] = `${lines[lines.length - 1]}…`;
-  return lines.slice(0, maxLines);
-}
-
 const CSV = {
   normalizeHeader(header = "") {
     return String(header)
@@ -950,92 +914,11 @@ function getQuestionImageSubject(question) {
   return cleanedBase || primaryAnswer;
 }
 
-function getQuestionImagePrompt(question) {
-  const subject = getQuestionImageSubject(question);
-  if (!subject) return "";
-  const phrasing = /^(a|an|the)\b/i.test(subject) ? subject : `a clean educational illustration of ${subject}`;
-  return `${phrasing}. Single subject, centered composition, realistic colors, no text, no labels, no watermark, no border, no collage.`;
-}
-
 function getQuestionImageSearchQuery(question) {
   const subject = getQuestionImageSubject(question);
   if (!subject) return "";
   return `${subject} reference image`;
 }
-
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error || new Error("Failed to read generated image"));
-    reader.readAsDataURL(blob);
-  });
-}
-
-const CloudflareImages = {
-  isConfigured() {
-    return CLOUDFLARE_IMAGE_ENABLED;
-  },
-
-  async generate(question) {
-    if (!this.isConfigured()) return "";
-    const prompt = getQuestionImagePrompt(question);
-    if (!prompt) return "";
-
-    const cacheKey = `${CLOUDFLARE_IMAGE_MODEL}:${prompt}`;
-    if (GENERATED_IMAGE_CACHE.has(cacheKey)) return GENERATED_IMAGE_CACHE.get(cacheKey);
-    if (GENERATED_IMAGE_PENDING.has(cacheKey)) return GENERATED_IMAGE_PENDING.get(cacheKey);
-
-    const task = (async () => {
-      const modelPath = CLOUDFLARE_IMAGE_MODEL.replace(/^\/+/, "");
-      const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${modelPath}`;
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-          "Content-Type": "application/json",
-          Accept: "image/png,image/*,application/json",
-        },
-        body: JSON.stringify({ prompt }),
-      });
-
-      if (!response.ok) {
-        const detail = await response.text().catch(() => "");
-        throw new Error(`Cloudflare image generation failed (${response.status})${detail ? `: ${detail.slice(0, 140)}` : ""}`);
-      }
-
-      const contentType = response.headers.get("content-type") || "";
-      let imageSrc = "";
-
-      if (contentType.includes("application/json")) {
-        const payload = await response.json();
-        const encoded = payload?.result?.image || payload?.result?.b64_json || payload?.image || payload?.result;
-        if (typeof encoded === "string" && encoded.startsWith("data:image/")) {
-          imageSrc = encoded;
-        } else if (typeof encoded === "string" && /^https?:\/\//i.test(encoded)) {
-          imageSrc = encoded;
-        } else if (typeof encoded === "string" && encoded.trim()) {
-          imageSrc = `data:image/png;base64,${encoded}`;
-        } else {
-          throw new Error("Cloudflare returned JSON without image data");
-        }
-      } else {
-        imageSrc = await blobToDataUrl(await response.blob());
-      }
-
-      GENERATED_IMAGE_CACHE.set(cacheKey, imageSrc);
-      return imageSrc;
-    })()
-      .catch(err => {
-        console.warn("[FM6] Cloudflare image generation:", err.message);
-        return "";
-      })
-      .finally(() => GENERATED_IMAGE_PENDING.delete(cacheKey));
-
-    GENERATED_IMAGE_PENDING.set(cacheKey, task);
-    return task;
-  },
-};
 
 const GoogleImageSearch = {
   isConfigured() {
@@ -1085,46 +968,9 @@ const GoogleImageSearch = {
   },
 };
 
-function createGeneratedQuestionImage(question) {
-  const prompt = getBaseQuestionPrompt(question) || "Generated image prompt";
-  const lines = splitPromptLines(prompt);
-  const answerType = question?.answerTypeLabel && question.answerTypeLabel !== "Answer" ? question.answerTypeLabel : "";
-  const palette = [
-    ["#0F172A", "#1D4ED8", "#38BDF8"],
-    ["#0B1120", "#166534", "#4ADE80"],
-    ["#111827", "#9333EA", "#F472B6"],
-    ["#131A2B", "#B45309", "#FBBF24"],
-  ];
-  const colors = palette[hashString(prompt) % palette.length];
-  const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="720" height="480" viewBox="0 0 720 480">
-      <defs>
-        <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stop-color="${colors[0]}"/>
-          <stop offset="55%" stop-color="${colors[1]}"/>
-          <stop offset="100%" stop-color="${colors[2]}"/>
-        </linearGradient>
-      </defs>
-      <rect width="720" height="480" rx="36" fill="url(#bg)"/>
-      <circle cx="96" cy="90" r="54" fill="rgba(255,255,255,.12)"/>
-      <circle cx="620" cy="118" r="82" fill="rgba(255,255,255,.08)"/>
-      <rect x="58" y="290" width="604" height="124" rx="28" fill="rgba(15,23,42,.34)" stroke="rgba(255,255,255,.18)"/>
-      <text x="72" y="78" fill="rgba(255,255,255,.88)" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="700">FlashMaster v6</text>
-      ${lines.map((line, index) => `<text x="72" y="${188 + index * 52}" fill="#FFFFFF" font-family="Segoe UI, Arial, sans-serif" font-size="34" font-weight="700">${escapeSvgText(line)}</text>`).join("")}
-      ${answerType ? `<text x="72" y="348" fill="rgba(255,255,255,.88)" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="600">Answer type: ${escapeSvgText(answerType)}</text>` : ""}
-      <text x="72" y="386" fill="rgba(255,255,255,.72)" font-family="Segoe UI, Arial, sans-serif" font-size="18">Generated fallback image</text>
-    </svg>
-  `;
-  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-}
-
 function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
-  const fallbackSvg = useMemo(
-    () => isImageQuestion(question) ? createGeneratedQuestionImage(question) : "",
-    [question?.id, question?.media, question?.question_text, question?.baseQuestionText, question?.answerTypeLabel]
-  );
   const generationSeed = `${question?.id || ""}:${question?.media || ""}:${question?.baseQuestionText || question?.question_text || ""}:${question?.answer || ""}`;
-  const [src, setSrc] = useState(() => question?.media || fallbackSvg);
+  const [src, setSrc] = useState(() => question?.media || "");
   const [loadingFallback, setLoadingFallback] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState("");
   const [fallbackTried, setFallbackTried] = useState(false);
@@ -1133,17 +979,6 @@ function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
     if (!isImageQuestion(question) || fallbackTried) return;
     setFallbackTried(true);
     setLoadingFallback(true);
-
-    if (CloudflareImages.isConfigured()) {
-      setLoadingMessage("Generating image with Cloudflare AI...");
-      const generated = await CloudflareImages.generate(question);
-      if (generated) {
-        setSrc(generated);
-        setLoadingFallback(false);
-        setLoadingMessage("");
-        return;
-      }
-    }
 
     if (GoogleImageSearch.isConfigured()) {
       setLoadingMessage("Searching Google Images...");
@@ -1156,39 +991,38 @@ function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
       }
     }
 
-    if (fallbackSvg) setSrc(fallbackSvg);
+    setSrc("");
     setLoadingFallback(false);
     setLoadingMessage("");
-  }, [question, fallbackTried, fallbackSvg]);
+  }, [question, fallbackTried]);
 
   useEffect(() => {
-    setSrc(question?.media || fallbackSvg);
+    setSrc(question?.media || "");
     setLoadingFallback(false);
     setLoadingMessage("");
     setFallbackTried(false);
-  }, [generationSeed, question?.media, fallbackSvg]);
+  }, [generationSeed, question?.media]);
 
   useEffect(() => {
     if (!question?.media) resolveFallbackImage();
   }, [question?.media, resolveFallbackImage]);
 
-  if (!question?.media && !fallbackSvg) return null;
+  if (!question?.media && !src) return null;
   if (isImageQuestion(question)) {
     return (
       <div style={{ width:"100%" }}>
         <img
-          src={src || fallbackSvg}
+          src={src}
           alt="Question prompt"
           style={{ maxWidth:"100%", maxHeight, borderRadius:10, marginBottom, objectFit:"contain", display:"block" }}
           onError={e => {
             e.currentTarget.style.display = "block";
-            if (!fallbackTried && (CloudflareImages.isConfigured() || GoogleImageSearch.isConfigured())) {
-              setSrc(fallbackSvg);
+            if (!fallbackTried && GoogleImageSearch.isConfigured()) {
+              setSrc("");
               resolveFallbackImage();
               return;
             }
-            if (fallbackSvg && src !== fallbackSvg) setSrc(fallbackSvg);
-            else e.currentTarget.style.display = "none";
+            e.currentTarget.style.display = "none";
           }}
         />
         {loadingFallback && (
@@ -2881,7 +2715,7 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
           >
             <div style={{ fontSize:48, marginBottom:12 }}>📥</div>
             <div style={{ fontWeight:700, fontSize:15, marginBottom:8 }}>Drop CSV or click to browse</div>
-            <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, type, difficulty, subtopic, explanation, media, answer-{answer-type}</div>
+            <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, type, difficulty, subtopic, explanation, media, answer-{"{answer-type}"}</div>
             <button className="btn btn-primary btn-lg" type="button" onClick={() => fileInputRef.current?.click()}>
               Choose File
             </button>
@@ -3446,27 +3280,9 @@ function SettingsScreen() {
           </div>
 
           <div style={{padding:"14px 0",borderBottom:"1px solid var(--border)"}}>
-            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Cloudflare AI Image Generation</div>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Google Image Search</div>
             <div style={{fontSize:12,color:"var(--muted)",marginBottom:10}}>
-              Missing image questions can request a generated image from Cloudflare Workers AI.
-            </div>
-            {CLOUDFLARE_IMAGE_ENABLED ? (
-              <>
-                <div style={{fontSize:11,color:"var(--green)",marginBottom:6}}>Configured</div>
-                <div style={{fontSize:11,color:"var(--muted)"}}>Model: <code style={{background:"var(--surface)",padding:"1px 5px",borderRadius:4}}>{CLOUDFLARE_IMAGE_MODEL}</code></div>
-              </>
-            ) : (
-              <div style={{fontSize:11,color:"var(--red)",marginBottom:6}}>Missing VITE_CLOUDFLARE_ACCOUNT_ID or VITE_CLOUDFLARE_API_TOKEN</div>
-            )}
-            <div style={{fontSize:11,color:"var(--accent)",marginTop:8,lineHeight:1.5}}>
-              This app calls Cloudflare directly from the browser. Use a restricted token, or move the call behind a server before production deployment.
-            </div>
-          </div>
-
-          <div style={{padding:"14px 0",borderBottom:"1px solid var(--border)"}}>
-            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Google Image Search Fallback</div>
-            <div style={{fontSize:12,color:"var(--muted)",marginBottom:10}}>
-              If Cloudflare does not return an image, the app can use Google Programmable Search image results as a fallback source.
+              Missing image questions use Google Programmable Search image results when no image URL is supplied in the data.
             </div>
             {GOOGLE_IMAGE_SEARCH_ENABLED ? (
               <div style={{fontSize:11,color:"var(--green)",marginBottom:6}}>Configured</div>
