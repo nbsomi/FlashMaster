@@ -865,11 +865,8 @@ function AppProvider({ children }) {
   });
   const [currentProfile, setCP]   = useState(null);
   const [screen,          setScreen]  = useState(() => {
-    // Start at google_login if no cached Google user; else go straight to profiles
-    try {
-      const cached = JSON.parse(localStorage.getItem("fm_google_user") || "null");
-      return cached ? "profiles" : "google_login";
-    } catch { return "google_login"; }
+    // Always open the Google sign-in screen first.
+    return "google_login";
   });
   const [nav,             setNav]     = useState({});
   const [toast,           setToast]   = useState(null);
@@ -1294,7 +1291,6 @@ function AppProvider({ children }) {
         setGdriveStatus("✅ Signed in (Drive pull skipped)");
       }
 
-      setScreen("profiles");
       showToast(`Welcome, ${user.name}! ✅`);
       return user;
     } catch (e) {
@@ -1304,13 +1300,13 @@ function AppProvider({ children }) {
     }
   }
 
-  function googleSignOut() {
+  function googleSignOut(silent = false) {
     GDrive.revokeToken();
     setGoogleUser(null);
     localStorage.removeItem("fm_google_user");
     setCP(null);
     setScreen("google_login");
-    showToast("Signed out");
+    if (!silent) showToast("Signed out");
   }
 
   // ── Continuous auto-sync engine ────────────────────────────
@@ -3072,13 +3068,30 @@ function ProfilesScreen() {
 // §21b  GOOGLE LOGIN SCREEN (mandatory first screen)
 // ══════════════════════════════════════════════════════════════
 function GoogleLoginScreen() {
-  const { googleClientId, googleSignIn, gdriveStatus } = useApp();
+  const {
+    navigate,
+    googleUser, googleClientId,
+    googleSignIn, googleSignOut,
+  } = useApp();
   const [signing, setSigning] = useState(false);
 
   async function handleSignIn() {
     setSigning(true);
-    await googleSignIn();
-    setSigning(false);
+    try {
+      await googleSignIn();
+    } finally {
+      setSigning(false);
+    }
+  }
+
+  async function handleNewUserLogin() {
+    setSigning(true);
+    try {
+      googleSignOut(true);
+      await googleSignIn();
+    } finally {
+      setSigning(false);
+    }
   }
 
   const GoogleLogo = () => (
@@ -3096,98 +3109,118 @@ function GoogleLoginScreen() {
       alignItems:"center", justifyContent:"center",
       padding:24, background:"var(--bg)",
     }}>
-      {/* Brand */}
-      <div style={{textAlign:"center",marginBottom:40}}>
-        <div style={{
-          fontSize:72, marginBottom:12,
-          filter:"drop-shadow(0 0 32px rgba(99,102,241,.5))",
-          animation:"float 3s ease-in-out infinite"
-        }}>⚡</div>
-        <div style={{fontFamily:"var(--syne)",fontWeight:900,fontSize:36,letterSpacing:-1}}>
-          FlashMaster
-        </div>
-        <div style={{color:"var(--muted)",fontSize:13,marginTop:6}}>
-          v5.1 · SM-2 Spaced Repetition · Google Drive Sync
+      <div style={{textAlign:"center",marginBottom:22}}>
+        <div style={{fontFamily:"var(--syne)",fontWeight:900,fontSize:34,letterSpacing:-1}}>
+          Flash Master
         </div>
       </div>
 
-      {/* Card */}
-      <div className="card" style={{width:"100%",maxWidth:420,padding:30}}>
-        <div style={{textAlign:"center",marginBottom:24}}>
-          <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:20,marginBottom:6}}>
-            Sign in to continue
-          </div>
-          <div style={{fontSize:13,color:"var(--muted)",lineHeight:1.5}}>
-            Google sign-in is required. Your profiles and progress sync automatically to Google Drive.
-          </div>
-        </div>
-
-        <div style={{fontSize:11,color:googleClientId?"var(--green)":"var(--accent)",marginBottom:16,textAlign:"center"}}>
-          {googleClientId ? "✅ Google OAuth configured" : "⚠️ Missing VITE_GOOGLE_CLIENT_ID"}
-        </div>
-
-        {/* Sign-in button */}
-        <button
-          className="btn btn-primary btn-lg"
-          style={{width:"100%",gap:12,fontSize:15}}
-          onClick={handleSignIn}
-          disabled={!googleClientId || signing}
-        >
-          {signing ? (
-            <span style={{display:"flex",alignItems:"center",gap:8}}>
-              <span style={{display:"inline-block",width:16,height:16,border:"2px solid rgba(255,255,255,.3)",borderTopColor:"white",borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>
-              Signing in…
-            </span>
-          ) : (
-            <><GoogleLogo /> Continue with Google</>
-          )}
-        </button>
-
-        {/* Status line */}
-        {gdriveStatus && (
-          <div style={{
-            marginTop:14, fontSize:12, textAlign:"center",
-            color: gdriveStatus.startsWith("✅")?"var(--green)"
-                 : gdriveStatus.startsWith("❌")?"var(--red)"
-                 : "var(--accent)",
-          }}>
-            {gdriveStatus}
-          </div>
-        )}
-
-        {/* Setup guide */}
-        <div style={{marginTop:22,padding:"14px 16px",background:"var(--surface)",borderRadius:12}}>
-          <div style={{fontWeight:700,fontSize:12,marginBottom:10,color:"var(--muted)",textTransform:"uppercase",letterSpacing:.5}}>
-            First-time setup
-          </div>
-          {[
-            ["1","Go to console.cloud.google.com → Create project"],
-            ["2","Enable Google Drive API"],
-            ["3","OAuth consent screen → External → Add your email as test user"],
-            ["4","Credentials → Create OAuth 2.0 Client ID → Web app"],
-            ["5","Add your domain to Authorized JavaScript Origins"],
-            ["6","Set VITE_GOOGLE_CLIENT_ID in your environment, then sign in"],
-          ].map(([n,t])=>(
-            <div key={n} style={{display:"flex",gap:10,marginBottom:8,alignItems:"flex-start"}}>
-              <div style={{
-                width:20,height:20,borderRadius:"50%",background:"var(--primary)",
-                color:"white",fontSize:10,fontWeight:800,
-                display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:1
-              }}>{n}</div>
-              <div style={{fontSize:12,color:"var(--muted)",lineHeight:1.4}}>{t}</div>
+      <div className="card" style={{width:"100%",maxWidth:460,padding:30}}>
+        {googleUser ? (
+          <>
+            <div style={{fontSize:11,fontWeight:800,color:"var(--muted)",textTransform:"uppercase",letterSpacing:.7,marginBottom:8}}>
+              Signed In With Google
             </div>
-          ))}
-        </div>
+            <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:26,letterSpacing:-.5,marginBottom:8}}>
+              Welcome back
+            </div>
+            <div style={{fontSize:14,color:"var(--muted)",lineHeight:1.55,marginBottom:18}}>
+              Continue with this account or sign in with another Google account.
+            </div>
+
+            <div style={{
+              display:"flex",alignItems:"center",gap:14,marginBottom:18,
+              padding:"16px 16px",background:"var(--surface)",border:"1px solid var(--border)",borderRadius:16,
+            }}>
+              {googleUser.picture ? (
+                <img src={googleUser.picture} alt="" style={{width:56,height:56,borderRadius:"50%",border:"2px solid var(--primary)",flexShrink:0}} />
+              ) : (
+                <div style={{
+                  width:56,height:56,borderRadius:"50%",background:"var(--card)",
+                  border:"1px solid var(--border)",display:"flex",alignItems:"center",
+                  justifyContent:"center",fontWeight:900,fontSize:22,color:"var(--primary)",flexShrink:0,
+                }}>
+                  {googleUser.name?.[0] || "G"}
+                </div>
+              )}
+              <div style={{minWidth:0}}>
+                <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:20,marginBottom:4}}>
+                  {googleUser.name}
+                </div>
+                <div style={{fontSize:13,color:"var(--muted)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                  {googleUser.email}
+                </div>
+              </div>
+            </div>
+
+            <div style={{height:1,background:"var(--border)",margin:"0 0 18px"}} />
+
+            <div style={{display:"grid",gap:10}}>
+              <button
+                className="btn btn-primary btn-lg"
+                style={{width:"100%"}}
+                onClick={()=>navigate("profiles")}
+              >
+                Load Profile Details
+              </button>
+              <button
+                className="btn btn-ghost btn-lg"
+                style={{width:"100%",gap:10}}
+                onClick={handleNewUserLogin}
+                disabled={!googleClientId || signing}
+              >
+                {signing ? (
+                  <span style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{display:"inline-block",width:16,height:16,border:"2px solid rgba(148,163,184,.4)",borderTopColor:"currentColor",borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>
+                    Opening Google sign-in...
+                  </span>
+                ) : (
+                  "Use Another Google Account"
+                )}
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={{fontSize:11,fontWeight:800,color:"var(--muted)",textTransform:"uppercase",letterSpacing:.7,marginBottom:8}}>
+              Account Access
+            </div>
+            <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:26,letterSpacing:-.5,marginBottom:8}}>
+              Sign in to continue
+            </div>
+            <div style={{fontSize:14,color:"var(--muted)",lineHeight:1.55,marginBottom:22}}>
+              Use your Google account to access Flash Master.
+            </div>
+
+            <button
+              className="btn btn-primary btn-lg"
+              style={{width:"100%",gap:12,fontSize:15}}
+              onClick={handleSignIn}
+              disabled={!googleClientId || signing}
+            >
+              {signing ? (
+                <span style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span style={{display:"inline-block",width:16,height:16,border:"2px solid rgba(255,255,255,.3)",borderTopColor:"white",borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>
+                  Signing in...
+                </span>
+              ) : (
+                <><GoogleLogo /> Sign in with Google</>
+              )}
+            </button>
+
+            <div style={{fontSize:12,color:"var(--muted)",marginTop:14}}>
+              You can switch accounts later.
+            </div>
+          </>
+        )}
       </div>
 
       <style>{`
-        @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
         @keyframes spin{to{transform:rotate(360deg)}}
       `}</style>
     </div>
   );
 }
-
 function SubjectsScreen() {
   const { subjects, createSubject, deleteSubject, navigate, importCSVToSubject, showToast } = useApp();
   const [modal,     setModal]    = useState(false);
