@@ -32,6 +32,7 @@ const GOOGLE_CLIENT_ID = (import.meta.env.VITE_GOOGLE_CLIENT_ID || "").trim();
 const GOOGLE_IMAGE_SEARCH_API_KEY = (import.meta.env.VITE_GOOGLE_IMAGE_SEARCH_API_KEY || "").trim();
 const GOOGLE_IMAGE_SEARCH_CX = (import.meta.env.VITE_GOOGLE_IMAGE_SEARCH_CX || "").trim();
 const GOOGLE_IMAGE_SEARCH_ENABLED = !!(GOOGLE_IMAGE_SEARCH_API_KEY && GOOGLE_IMAGE_SEARCH_CX);
+const DOCUMENTATION_URL = `${import.meta.env.BASE_URL}documentation/index.html`;
 const GOOGLE_IMAGE_CACHE = new Map();
 const GOOGLE_IMAGE_PENDING = new Map();
 
@@ -3223,6 +3224,9 @@ function SettingsScreen() {
           <Row label="UI Language"><Sel k="uiLang" opts={[["en","English"],["hi","Hindi"],["ta","Tamil"],["te","Telugu"],["fr","French"],["de","German"],["es","Spanish"],["zh","中文"],["ar","العربية"],["ja","日本語"]]} /></Row>
           <Row label="Haptic Feedback" sub="Vibrate on correct/wrong"><Tog k="hapticFeedback" /></Row>
           <Row label="Focus Mode" sub="Hides nav during study"><Tog k="focusMode" /></Row>
+          <Row label="Documentation" sub="Open the full project documentation in a new tab">
+            <a className="btn btn-ghost btn-sm" href={DOCUMENTATION_URL} target="_blank" rel="noreferrer" style={{ textDecoration:"none" }}>Docs</a>
+          </Row>
           {pwaPrompt && <Row label="Install App" sub="Add to home screen"><button className="btn btn-primary btn-sm" onClick={async()=>{pwaPrompt.prompt();await pwaPrompt.userChoice;}}>📲 Install</button></Row>}
         </>)}
         {sec==="learning" && (<>
@@ -3947,6 +3951,11 @@ function Sidebar({ screen, navigate, currentProfile, streak, due }) {
           </div>
         ))}
       </nav>
+      <div style={{padding:"8px 6px 14px",borderTop:"1px solid var(--border)"}}>
+        <a className="nav-link" href={DOCUMENTATION_URL} target="_blank" rel="noreferrer" style={{ textDecoration:"none" }}>
+          <span style={{fontSize:19}}>📚</span><span>Documentation</span>
+        </a>
+      </div>
     </aside>
   );
 }

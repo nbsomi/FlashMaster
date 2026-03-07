@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FlashMaster Documentation</title>
+    <style>
+      :root{--bg:#f3eee5;--card:#fffaf2;--ink:#1d1915;--muted:#665b50;--line:#dccdbb;--accent:#8e3d2f;--accent2:#1f6b70;--mono:Consolas,monospace;--sans:"Segoe UI",Arial,sans-serif;--serif:Georgia,serif}
+      *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font-family:var(--sans);color:var(--ink);background:linear-gradient(180deg,#f8f2e9,#f3eee5)}
+      a{color:var(--accent)}code,pre{font-family:var(--mono)}pre{background:#151413;color:#f7f0e6;padding:16px;border-radius:16px;overflow:auto;line-height:1.55}
+      .hero,.wrap,.foot{max-width:1180px;margin:0 auto}.hero{padding:44px 20px 28px}.wrap{padding:0 20px 28px;display:grid;grid-template-columns:250px minmax(0,1fr);gap:20px}
+      .badge{display:inline-block;padding:7px 11px;border-radius:999px;background:#f1ddd5;color:var(--accent);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+      h1{font-family:var(--serif);font-size:clamp(2.2rem,4vw,3.8rem);line-height:1.02;margin:16px 0 10px}h2{font-family:var(--serif);font-size:29px;margin:0 0 12px}h3{margin:18px 0 10px;font-size:18px}
+      .lead{font-size:16px;line-height:1.75;color:var(--muted);max-width:820px}.card,section,nav{background:var(--card);border:1px solid var(--line);border-radius:24px;box-shadow:0 14px 32px rgba(60,39,20,.07)}
+      .hero-grid,.grid2,.grid3,.flow{display:grid;gap:14px}.hero-grid{grid-template-columns:1.4fr .9fr}.grid2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid3{grid-template-columns:repeat(3,minmax(0,1fr))}.flow{grid-template-columns:repeat(4,minmax(0,1fr))}
+      .card{padding:18px}nav{position:sticky;top:18px;align-self:start;padding:20px}nav h2{font-size:15px;margin-bottom:10px}nav ol{margin:0;padding-left:18px}nav li{margin:0 0 9px}
+      section{padding:24px;margin-bottom:20px}p,li{line-height:1.7}.muted{color:var(--muted)}.chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:15px}.chip{padding:9px 12px;border:1px solid var(--line);border-radius:999px;background:#f6efe4;font-size:13px;font-weight:700}
+      table{width:100%;border-collapse:collapse;min-width:680px}th,td{padding:11px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}th{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+      .table{overflow:auto}.callout{padding:14px 16px;border-radius:18px;border:1px solid var(--line);margin-top:14px}.warn{background:#fff4df;border-color:#e0c286}.info{background:#deefed;border-color:#9dc8c6}.step{padding:14px;border:1px solid var(--line);border-radius:18px;background:#fffdf8}.step strong{display:block;margin-bottom:8px;color:var(--accent)}
+      .foot{padding:0 20px 36px;color:var(--muted);font-size:13px}
+      @media (max-width:1050px){.wrap,.hero-grid,.grid2,.grid3,.flow{grid-template-columns:1fr}nav{position:static}table{min-width:0}}
+    </style>
+  </head>
+  <body>
+    <header class="hero">
+      <div class="hero-grid">
+        <div>
+          <span class="badge">FlashMaster v6 Documentation</span>
+          <h1>Technical documentation for the current FlashMaster repository.</h1>
+          <p class="lead">
+            This page documents the code that is currently in the repo: runtime structure, screen map, IndexedDB schema,
+            CSV import behavior, Google Drive sync, environment configuration, and practical maintenance notes.
+            Most application logic lives in <code>src/FlashMaster.jsx</code>.
+          </p>
+          <div class="chips">
+            <span class="chip">React 18</span>
+            <span class="chip">Vite 5</span>
+            <span class="chip">Dexie + IndexedDB</span>
+            <span class="chip">Google OAuth + Drive</span>
+            <span class="chip">SM-2 review engine</span>
+            <span class="chip">CSV-first content import</span>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Quick facts</h3>
+          <ul>
+            <li>Main app file: <code>src/FlashMaster.jsx</code></li>
+            <li>Entry path: <code>src/main.jsx</code> -> <code>src/App.jsx</code> -> <code>src/FlashMaster.jsx</code></li>
+            <li>Auth model: Google sign-in is required by default</li>
+            <li>Auto-sync debounce: 4 seconds</li>
+            <li>Primary storage: IndexedDB via Dexie</li>
+            <li>Question management: CSV imports only in the current UI</li>
+          </ul>
+        </div>
+      </div>
+    </header>
+
+    <div class="wrap">
+      <nav aria-label="Table of contents">
+        <h2>Contents</h2>
+        <ol>
+          <li><a href="#overview">Overview</a></li>
+          <li><a href="#stack">Stack and architecture</a></li>
+          <li><a href="#data">Data model</a></li>
+          <li><a href="#screens">Screen map</a></li>
+          <li><a href="#content">Content model</a></li>
+          <li><a href="#csv">CSV import</a></li>
+          <li><a href="#sync">Sync and backup</a></li>
+          <li><a href="#config">Configuration</a></li>
+          <li><a href="#workflow">Developer workflow</a></li>
+          <li><a href="#notes">Maintenance notes</a></li>
+        </ol>
+      </nav>
+
+      <main>
+        <section id="overview">
+          <h2>1. Overview</h2>
+          <p class="lead">
+            FlashMaster is an offline-first study application organized around profiles, subjects, topics, subtopics,
+            flash review, quizzes, analytics, and Google Drive sync. The app loads local collections into React state,
+            scopes them by active profile in memory, and persists updates back to IndexedDB through Dexie helper methods.
+          </p>
+          <div class="grid2">
+            <div class="card">
+              <h3>Core capabilities</h3>
+              <ul>
+                <li>Profile-based content and progress tracking</li>
+                <li>Flash study using SM-2 style scheduling</li>
+                <li>Quiz sessions with adaptive selection and timers</li>
+                <li>Analytics driven by review history and quiz attempts</li>
+                <li>CSV import with preview and validation</li>
+                <li>Google Drive backup / restore</li>
+                <li>Speech synthesis and speech recognition helpers</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h3>Current operating assumptions</h3>
+              <ul>
+                <li>The app uses state-based screen navigation, not route-based navigation.</li>
+                <li>Google login is the default access gate.</li>
+                <li>Question content is loaded from CSV imports in the current UI flow.</li>
+                <li>Missing image media can use Google image search if configured; there is no SVG or AI fallback now.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <section id="stack">
+          <h2>2. Stack and architecture</h2>
+          <div class="table">
+            <table>
+              <thead>
+                <tr><th>Layer</th><th>Implementation</th><th>Notes</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>Build tool</td><td><code>vite</code></td><td>Minimal Vite setup with React plugin.</td></tr>
+                <tr><td>UI</td><td><code>react</code>, <code>react-dom</code></td><td>Single-page app mounted from <code>src/main.jsx</code>.</td></tr>
+                <tr><td>Persistence</td><td><code>dexie</code></td><td>Loaded from CDN at runtime and used against IndexedDB.</td></tr>
+                <tr><td>Charts</td><td><code>recharts</code></td><td>Analytics visualizations.</td></tr>
+                <tr><td>Auth / sync</td><td>Google Identity Services + Drive REST</td><td>Client-side sign-in and profile file sync.</td></tr>
+                <tr><td>Speech</td><td>Browser speech APIs</td><td><code>speechSynthesis</code> and <code>SpeechRecognition</code> / <code>webkitSpeechRecognition</code>.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Runtime modules inside <code>src/FlashMaster.jsx</code></h3>
+          <div class="grid2">
+            <div class="card">
+              <ul>
+                <li><strong>GDrive</strong>: token, folder, file upload / download, pull / push.</li>
+                <li><strong>DB</strong>: Dexie CRUD, export, and import helpers.</li>
+                <li><strong>SRS</strong>: interval, due, queue, and rating logic.</li>
+                <li><strong>ReviewQueue</strong>: flash deck prioritization.</li>
+              </ul>
+            </div>
+            <div class="card">
+              <ul>
+                <li><strong>CSV</strong>: parse, validate, preview, and import grouping.</li>
+                <li><strong>Speech</strong>: TTS and pronunciation helpers.</li>
+                <li><strong>Crypto</strong>: encrypted backup support.</li>
+                <li><strong>AppProvider</strong>: central state owner for the whole app.</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="flow">
+            <div class="step"><strong>Boot</strong>Open Dexie, run migrations, and load all persisted collections.</div>
+            <div class="step"><strong>Access</strong>Require Google login, then show the profile selector.</div>
+            <div class="step"><strong>Study</strong>Render flash or quiz sessions from in-memory filtered data.</div>
+            <div class="step"><strong>Sync</strong>Debounce changes and upload the active profile slice to Drive.</div>
+          </div>
+        </section>
+
+        <section id="data">
+          <h2>3. Data model</h2>
+          <p class="lead">
+            Dexie uses a database named <code>FlashMasterV4</code>. Schema versions 1 through 3 are declared in code,
+            and the app exports payloads for backup and Drive sync from the loaded collections.
+          </p>
+          <div class="table">
+            <table>
+              <thead>
+                <tr><th>Table</th><th>Key fields / indexes</th><th>Role</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code>profiles</code></td><td><code>id</code>, <code>name</code></td><td>Local study personas.</td></tr>
+                <tr><td><code>subjects</code></td><td><code>id</code>, <code>uid</code>, <code>name</code></td><td>Top-level content groups.</td></tr>
+                <tr><td><code>topics</code></td><td><code>id</code>, <code>sid</code>, <code>name</code></td><td>Subject children.</td></tr>
+                <tr><td><code>subtopics</code></td><td><code>id</code>, <code>tid</code>, <code>name</code></td><td>Question grouping level.</td></tr>
+                <tr><td><code>questions</code></td><td><code>id</code>, <code>stid</code>, <code>type</code>, <code>difficulty</code></td><td>Question content and metadata.</td></tr>
+                <tr><td><code>flashProgress</code></td><td><code>[uid+qid]</code>, <code>nextReview</code>, <code>status</code>, <code>box</code></td><td>Spaced repetition state.</td></tr>
+                <tr><td><code>quizAttempts</code></td><td><code>uid</code>, <code>tid</code>, <code>stid</code>, <code>attempt_date</code></td><td>Quiz history.</td></tr>
+                <tr><td><code>reviewHistory</code></td><td><code>uid</code>, <code>qid</code>, <code>timestamp</code>, <code>grade</code></td><td>Analytics event log.</td></tr>
+                <tr><td><code>studySessions</code></td><td><code>uid</code>, <code>date</code></td><td>Supplementary session tracking.</td></tr>
+                <tr><td><code>leaderboard</code></td><td><code>id</code>, <code>uid</code></td><td>Aggregated quiz standings.</td></tr>
+                <tr><td><code>audioCache</code></td><td><code>id</code>, <code>url</code></td><td>Declared, but not central to the current flow.</td></tr>
+                <tr><td><code>sessionDraft</code></td><td><code>id</code>, <code>uid</code></td><td>Flash session resume state.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout warn">
+            <strong>Important:</strong> export currently includes leaderboard data, but <code>importAll</code> restores
+            profiles, content, flash progress, quiz attempts, study sessions, and review history only. Leaderboard,
+            audio cache, and session draft are not bulk-imported by the current implementation.
+          </div>
+        </section>
+
+        <section id="screens">
+          <h2>4. Screen map</h2>
+          <div class="grid3">
+            <div class="card">
+              <h3>Access</h3>
+              <ul>
+                <li><strong>GoogleLoginScreen</strong></li>
+                <li><strong>ProfilesScreen</strong></li>
+              </ul>
+            </div>
+            <div class="card">
+              <h3>Content</h3>
+              <ul>
+                <li><strong>SubjectsScreen</strong></li>
+                <li><strong>TopicsScreen</strong></li>
+                <li><strong>SubtopicsScreen</strong></li>
+                <li><strong>QuestionsScreen</strong></li>
+              </ul>
+            </div>
+            <div class="card">
+              <h3>Study and reporting</h3>
+              <ul>
+                <li><strong>Dashboard</strong></li>
+                <li><strong>PlannerScreen</strong></li>
+                <li><strong>FlashScreen</strong></li>
+                <li><strong>QuizScreen</strong></li>
+                <li><strong>AnalyticsScreen</strong></li>
+                <li><strong>LeaderboardScreen</strong></li>
+                <li><strong>SettingsScreen</strong></li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <section id="content">
+          <h2>5. Question and content model</h2>
+          <p class="lead">
+            The renderer supports Text, Image, Audio, MCQ, TrueFalse, FillBlank, MultiSelect, Match, Order, Cloze,
+            and Dictation. Question helpers can select answer variants, build alternate prompts, and render media.
+          </p>
+          <div class="grid2">
+            <div class="card">
+              <h3>Answer model</h3>
+              <ul>
+                <li>Primary <code>answer</code> plus optional <code>answerVariants</code></li>
+                <li>Variant headers like <code>answer-capital</code> become labeled answer targets</li>
+                <li>Study mode can rotate which answer label is requested</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h3>Media model</h3>
+              <ul>
+                <li><code>media</code> can be an image or audio URL</li>
+                <li>Missing image media can trigger Google image search if configured</li>
+                <li>No local placeholder image or AI image generation remains in the current build</li>
+              </ul>
+            </div>
+          </div>
+          <div class="callout info">
+            <strong>Authoring note:</strong> the renderer supports interactive types, but the current CSV importer does
+            not parse an <code>options</code> column. In practice, CSV import is best for prompt-and-answer style content,
+            plus image or audio prompts and labeled answer variants.
+          </div>
+        </section>
+
+        <section id="csv">
+          <h2>6. CSV import</h2>
+          <p class="lead">
+            CSV import follows a parse -&gt; validate -&gt; preview -&gt; import flow. The parser handles BOM-prefixed files,
+            quoted commas, escaped quotes, and multiline cells. The importer can auto-create topics and subtopics.
+          </p>
+          <div class="table">
+            <table>
+              <thead>
+                <tr><th>Column</th><th>Meaning</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code>question_text</code> / <code>question</code> / <code>q</code></td><td>Main prompt text.</td></tr>
+                <tr><td><code>answer</code> / <code>a</code></td><td>Legacy single-answer column.</td></tr>
+                <tr><td><code>answer-*</code></td><td>Labeled answer variants such as <code>answer-capital</code>.</td></tr>
+                <tr><td><code>type</code></td><td>Question type, commonly Text, Image, or Audio in CSV imports.</td></tr>
+                <tr><td><code>difficulty</code> / <code>diff</code></td><td><code>easy</code>, <code>medium</code>, or <code>hard</code>.</td></tr>
+                <tr><td><code>subtopic</code> / <code>subtopic_hint</code></td><td>Subtopic grouping name.</td></tr>
+                <tr><td><code>explanation</code> / <code>explain</code></td><td>Explanation text for study and quiz views.</td></tr>
+                <tr><td><code>media</code></td><td>Image or audio URL.</td></tr>
+                <tr><td><code>tags</code></td><td>Stored metadata.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <pre>question_text,type,difficulty,subtopic,explanation,media,answer-capital,answer-currency
+India,Text,medium,Geography,Answer one requested field,,New Delhi,Rupee
+Identify this fruit,Image,easy,Objects,Image URL optional if Google image search is configured,,Apple,
+Identify this anthem,Audio,medium,Culture,Listen and answer,https://example.com/audio.mp3,National Anthem,</pre>
+        </section>
+
+        <section id="sync">
+          <h2>7. Sync and backup</h2>
+          <div class="grid2">
+            <div class="card">
+              <h3>Google Drive sync</h3>
+              <ul>
+                <li>Uses Google OAuth and a Drive folder named <code>FlashMaster</code></li>
+                <li>Pulls profile files on login</li>
+                <li>Auto-syncs the active profile after a 4 second debounce</li>
+                <li>Manual sync and restore actions exist in Settings</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h3>Backup / restore</h3>
+              <ul>
+                <li>Exports local JSON snapshots from IndexedDB</li>
+                <li>Supports optional AES-GCM encrypted backups</li>
+                <li>Restores by importing JSON back into Dexie and reloading memory state</li>
+              </ul>
+            </div>
+          </div>
+          <div class="flow">
+            <div class="step"><strong>Sign in</strong>Acquire token and user info.</div>
+            <div class="step"><strong>Restore</strong>Import any profile files pulled from Drive.</div>
+            <div class="step"><strong>Work</strong>Study locally and persist into IndexedDB.</div>
+            <div class="step"><strong>Push</strong>Upload the active profile slice to Drive.</div>
+          </div>
+        </section>
+
+        <section id="config">
+          <h2>8. Configuration</h2>
+          <p class="lead">
+            Google OAuth is required for the normal access path. Google image search is optional and only affects
+            image questions that do not already have a <code>media</code> URL.
+          </p>
+          <pre>VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id
+VITE_GOOGLE_IMAGE_SEARCH_API_KEY=your_google_custom_search_api_key
+VITE_GOOGLE_IMAGE_SEARCH_CX=your_google_programmable_search_engine_id</pre>
+          <div class="callout warn">
+            <strong>Repository note:</strong> the checked-in <code>.env</code> file may still contain comments from
+            older image-generation experiments, but the current runtime code reads the Google variables shown here.
+          </div>
+        </section>
+
+        <section id="workflow">
+          <h2>9. Developer workflow</h2>
+          <div class="grid2">
+            <div class="card">
+              <h3>Run locally</h3>
+              <pre>npm install
+npm run dev</pre>
+            </div>
+            <div class="card">
+              <h3>Build and preview</h3>
+              <pre>npm run build
+npm run preview</pre>
+            </div>
+          </div>
+          <h3>Recommended verification checklist</h3>
+          <ul>
+            <li>Verify Google sign-in.</li>
+            <li>Import a CSV into a subject and confirm topic / subtopic creation.</li>
+            <li>Run one flash session and one quiz attempt.</li>
+            <li>Export and re-import a local backup.</li>
+            <li>Trigger Drive sync and confirm profile files exist remotely.</li>
+          </ul>
+        </section>
+
+        <section id="notes">
+          <h2>10. Maintenance notes</h2>
+          <div class="grid2">
+            <div class="card">
+              <h3>Operational constraints</h3>
+              <ul>
+                <li>Browser support for IndexedDB and Google auth popups is required.</li>
+                <li>Speech behavior varies by browser because it depends on built-in APIs.</li>
+                <li>Drive sync is entirely client-side.</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h3>Code structure notes</h3>
+              <ul>
+                <li><code>src/FlashMaster.jsx</code> mixes UI, persistence, algorithms, and integrations.</li>
+                <li>A future refactor would naturally split storage, sync, renderers, and screens.</li>
+                <li>Documentation should be updated when schema versions, CSV format, or sync payload shape changes.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="foot">
+      Generated from the current repository snapshot using <code>src/main.jsx</code>, <code>src/App.jsx</code>,
+      <code>src/FlashMaster.jsx</code>, <code>package.json</code>, <code>vite.config.js</code>, and <code>.env</code>.
+    </div>
+  </body>
+</html>
