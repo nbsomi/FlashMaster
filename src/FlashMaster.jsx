@@ -97,7 +97,7 @@ const GDrive = {
           resolve(resp.access_token);
         },
       });
-      tc.requestAccessToken({ prompt: interactive ? "consent" : "none" });
+      tc.requestAccessToken({ prompt: interactive ? "" : "none" });
     });
   },
 
@@ -181,12 +181,44 @@ const GDrive = {
     return res.files?.[0] || null;
   },
 
+  // ── Resumable upload for large files (>4 MB) ──────────────
+  async _resumableUpload(token, folderId, filename, content, existingId = null) {
+    const initiateUrl = existingId
+      ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=resumable`
+      : "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id";
+    const metadataBody = existingId ? {} : { name: filename, parents: [folderId] };
+    const initResp = await fetch(initiateUrl, {
+      method  : existingId ? "PATCH" : "POST",
+      headers : {
+        Authorization              : `Bearer ${token}`,
+        "Content-Type"             : "application/json; charset=UTF-8",
+        "X-Upload-Content-Type"    : "application/json",
+        "X-Upload-Content-Length"  : String(new Blob([content]).size),
+      },
+      body: JSON.stringify(metadataBody),
+    });
+    if (!initResp.ok) throw new Error(`Resumable initiate: ${initResp.status}`);
+    const uploadUrl = initResp.headers.get("Location");
+    if (!uploadUrl) throw new Error("No upload URL from Drive resumable initiate");
+    const upResp = await fetch(uploadUrl, {
+      method  : "PUT",
+      headers : { "Content-Type": "application/json" },
+      body    : content,
+    });
+    if (!upResp.ok) throw new Error(`Resumable PUT: ${upResp.status}`);
+    const result = await upResp.json().catch(() => ({ id: existingId }));
+    return result.id || existingId;
+  },
+
   async uploadFile(token, folderId, filename, data) {
-    const content  = JSON.stringify(data, null, 2);
+    // Compact JSON — no indentation. Removes ~20-30 % of size versus null,2.
+    const content  = JSON.stringify(data);
+    const isLarge  = content.length > 4_000_000; // >4 MB → use resumable upload
     const existing = await this.findFile(token, folderId, filename);
 
     if (existing) {
-      // Update content (media PATCH)
+      if (isLarge) return this._resumableUpload(token, folderId, filename, content, existing.id);
+      // Simple media PATCH for small files
       const r = await fetch(
         `https://www.googleapis.com/upload/drive/v3/files/${existing.id}?uploadType=media`,
         {
@@ -199,8 +231,10 @@ const GDrive = {
       return existing.id;
     }
 
-    // Multipart upload (metadata + media)
-    const meta = JSON.stringify({ name: filename, parents: [folderId] });
+    if (isLarge) return this._resumableUpload(token, folderId, filename, content, null);
+
+    // Multipart upload (metadata + media) for new small files
+    const meta     = JSON.stringify({ name: filename, parents: [folderId] });
     const boundary = "fmboundary" + Date.now();
     const body = [
       `--${boundary}`,
@@ -1241,7 +1275,9 @@ const Speech = {
   _normalizeSpeakText(text) {
     const value = String(text || "").replace(/\s+/g, " ").trim();
     if (!value) return "";
-    return value.includes(" ") ? value : `${value}.`;
+    // Single words get a comma+period so the TTS engine registers a natural
+    // pause and speaks the whole word instead of cutting the tail off.
+    return value.includes(" ") ? value : `${value},`;
   },
 
   _pickVoice(lang) {
@@ -1292,9 +1328,12 @@ const Speech = {
       synth.resume?.();
     };
     const primeAndSpeak = () => {
-      const primer = this._buildUtterance("a", lang, Math.max(rate, 1), 0);
-      primer.onend = () => queue(speakMain, 10);
-      primer.onerror = () => queue(speakMain, 10);
+      // Volume must be > 0 (even if near-zero) so Safari/WebKit reliably fires onend.
+      // 150 ms post-primer gap lets the audio pipeline fully warm up before the
+      // real utterance starts — prevents the first word being clipped.
+      const primer = this._buildUtterance(".", lang, Math.max(rate, 1), 0.01);
+      primer.onend   = () => queue(speakMain, 150);
+      primer.onerror = () => queue(speakMain, 150);
       synth.speak(primer);
       synth.resume?.();
     };
@@ -1304,7 +1343,7 @@ const Speech = {
       queue(primeAndSpeak, 140);
       return;
     }
-    queue(primeAndSpeak, 20);
+    queue(primeAndSpeak, 50);
   },
   cancel() {
     if (this._speakTimer) {
@@ -2084,10 +2123,30 @@ function AppProvider({ children }) {
     try {
       setGdriveStatus("Checking Google sign-in…");
       const token = await GDrive.requestToken(googleClientId, false);
-      await completeGoogleSession(token);
+      // Silent success — refresh token + user info but skip full Drive restore.
+      // The background pull effect handles incremental syncs every 30 s.
+      await completeGoogleSession(token, { restoreProfiles: false });
       return true;
     } catch (e) {
       console.warn("[FM6] Silent Google session check failed:", e.message);
+
+      // If we have a cached user, keep them logged in with local data.
+      // Only a full sign-out or revocation should clear the account.
+      const cachedUser = (() => {
+        try { return JSON.parse(localStorage.getItem("fm_google_user") || "null"); }
+        catch { return null; }
+      })();
+
+      if (cachedUser) {
+        // Stay logged in; Drive sync will recover once the user explicitly
+        // signs in again or the token client manages a silent refresh later.
+        setGoogleUser(cachedUser);
+        setGdriveStatus("⚠️ Drive sync paused — tap ☁️ Push to re-authenticate");
+        setScreen("profiles");
+        return false;
+      }
+
+      // No cached user at all → must sign in from scratch
       stopProfileLockHeartbeat();
       activeProfileLockRef.current = null;
       GDrive.revokeToken();
@@ -2169,10 +2228,13 @@ function AppProvider({ children }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     uid_,
-    // Watch the lengths/timestamps of every mutable collection
+    // Watch lengths AND a content-change signal for flash progress so that
+    // rating an already-seen card (no length change) still triggers a sync.
     subjects.length, topics.length, subtopics.length, questions.length,
-    flashProg.length, quizAttempts.length, reviewHistory.length,
-    profiles.length,
+    flashProg.length, quizAttempts.length, reviewHistory.length, profiles.length,
+    // Derived: last review timestamp acts as a "something changed" sentinel
+    flashProg[flashProg.length - 1]?.lastReview,
+    reviewHistory[reviewHistory.length - 1]?.timestamp,
   ]);
 
   // ── Google Drive: manual push (for Settings panel) ────────
