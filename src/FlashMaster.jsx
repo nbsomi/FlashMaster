@@ -2710,9 +2710,15 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
   }
 
   return (
-    <Modal title="Import Questions" onClose={onClose} wide>
+    <Modal title="Import CSV or ZIP Images" onClose={onClose} wide>
       {step === "upload" && (
         <div>
+          <div className="card" style={{ marginBottom:16, padding:14 }}>
+            <div style={{ fontWeight:700, fontSize:13, marginBottom:6 }}>Two import methods are available</div>
+            <div style={{ fontSize:12, color:"var(--muted)", lineHeight:1.6 }}>
+              Use <strong>CSV + Media URLs</strong> for hosted image or audio links. Use <strong>ZIP Images</strong> when the picture filename should become the answer.
+            </div>
+          </div>
           <div style={{ display:"flex", gap:10, marginBottom:16, flexWrap:"wrap" }}>
             {Object.entries(IMPORT_MODE_META).map(([key, meta]) => (
               <button
@@ -2748,6 +2754,9 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
             }}
           >
             <div style={{ fontSize:48, marginBottom:12 }}>📥</div>
+            <div style={{ fontSize:11, fontWeight:800, letterSpacing:.4, color:"var(--primary)", textTransform:"uppercase", marginBottom:6 }}>
+              {mode === "zip" ? "ZIP Image Import" : "CSV Import"}
+            </div>
             <div style={{ fontWeight:700, fontSize:15, marginBottom:8 }}>{modeMeta.prompt}</div>
             <div style={{ fontSize:12, color:"var(--muted)", marginBottom:8 }}>{modeMeta.helper}</div>
             {mode === "csv" && <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, type, difficulty, subtopic, explanation, media, media_url, answer-{"{answer-type}"}</div>}
@@ -3325,14 +3334,22 @@ function SettingsScreen() {
         {sec==="cloud" && (<>
           {/* Step 1: OAuth config */}
           <div style={{padding:"14px 0",borderBottom:"1px solid var(--border)"}}>
-            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Google OAuth Configuration</div>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Google Sign-In Configuration</div>
             <div style={{fontSize:12,color:"var(--muted)",marginBottom:10}}>
-              Client ID is loaded from environment and hidden from the UI.
+              Only <code style={{background:"var(--surface)",padding:"1px 5px",borderRadius:4}}>VITE_GOOGLE_CLIENT_ID</code> is required here. Image import no longer uses search API environment variables.
             </div>
             {googleClientId
               ? <div style={{fontSize:11,color:"var(--green)",marginTop:6}}>✅ Client ID configured</div>
               : <div style={{fontSize:11,color:"var(--red)",marginTop:6}}>❌ Missing VITE_GOOGLE_CLIENT_ID</div>
             }
+          </div>
+
+          <div style={{padding:"14px 0",borderBottom:"1px solid var(--border)"}}>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>Image Import</div>
+            <div style={{fontSize:12,color:"var(--muted)",lineHeight:1.6}}>
+              Image questions now come from explicit media only: either a <code style={{background:"var(--surface)",padding:"1px 5px",borderRadius:4}}>media</code> or <code style={{background:"var(--surface)",padding:"1px 5px",borderRadius:4}}>media_url</code> value in CSV, or a ZIP image upload where the filename becomes the answer.
+            </div>
+            <div style={{fontSize:11,color:"var(--green)",marginTop:8}}>No separate image API keys are required.</div>
           </div>
 
           {/* Step 2: Sign In */}
@@ -3402,7 +3419,7 @@ function SettingsScreen() {
           <div style={{padding:"14px 0"}}>
             <div style={{fontWeight:700,fontSize:13,marginBottom:8}}>How it works</div>
             {[
-              ["1️⃣","Set up Google Cloud","Create an OAuth 2.0 Client ID with your app domain as an Authorized JavaScript Origin"],
+              ["1️⃣","Set up Google Cloud","Create an OAuth 2.0 Client ID with your app domain as an Authorized JavaScript Origin. No image search API keys are needed."],
               ["2️⃣","Sign in","Authenticate with your Google account using OAuth 2.0 (no passwords stored)"],
               ["3️⃣","Push Profile","Exports your current profile's data to Drive as a JSON file in the FlashMaster folder"],
               ["4️⃣","Restore","Downloads all profile JSONs from the FlashMaster folder and imports them into this device"],
