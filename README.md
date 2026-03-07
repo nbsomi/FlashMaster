@@ -92,28 +92,32 @@ FlashMaster supports two import methods in the current UI.
 Common columns:
 
 - `question_text`
-- `type`
+- `type` (optional)
 - `difficulty`
 - `subtopic`
 - `explanation`
 - `media`
 - `media_url`
+- `options`
 - `answer`
 - `answer-capital`, `answer-currency`, or other `answer-*` variant columns
 
 Example:
 
 ```csv
-question_text,type,difficulty,subtopic,explanation,media,answer-capital,answer-currency
-India,Text,medium,Geography,Answer one requested field,,New Delhi,Rupee
-Identify this monument,Image,medium,Landmarks,Uses the supplied image,https://example.com/taj-mahal.jpg,Taj Mahal,
-Identify this anthem,Audio,medium,Culture,Listen and answer,https://example.com/audio.mp3,National Anthem,
+question_text,difficulty,subtopic,explanation,media,options,answer
+Capital of France?,medium,Geography,Choose one,,"Paris,London,Berlin,Rome",Paris
+The sky is blue.,easy,Science,Answer true or false,,,True
+Identify this monument,medium,Landmarks,Uses the supplied image,https://example.com/taj-mahal.jpg,,Taj Mahal
+Identify this anthem,medium,Culture,Listen and answer,https://example.com/audio.mp3,,National Anthem
 ```
 
 Notes:
 
-- Image rows now require `media` or `media_url`.
-- If `type` is `Image` and the media URL is blank, the row is skipped during import.
+- `type` is optional. The importer infers `Image`, `Audio`, `TrueFalse`, `MCQ`, `MultiSelect`, `Match`, `Order`, and `Cloze` from the row data.
+- Image rows still require `media` or `media_url`.
+- `MCQ`, `MultiSelect`, and `Match` rows still require an `options` column.
+- Quote any `options` or `answer` cell that contains commas.
 
 ### 2. ZIP image import
 

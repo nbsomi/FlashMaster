@@ -245,9 +245,9 @@
             </div>
           </div>
           <div class="callout info">
-            <strong>Authoring note:</strong> the renderer supports interactive types, but the current importers do not parse
-            an <code>options</code> column. In practice, CSV import is best for prompt-and-answer style content plus image
-            or audio prompts, while ZIP import is best for filename-driven image decks.
+            <strong>Authoring note:</strong> interactive CSV rows can now supply an <code>options</code> column for
+            <code>MCQ</code>, <code>MultiSelect</code>, and <code>Match</code>. ZIP import remains best for filename-driven
+            image decks.
           </div>
         </section>
 
@@ -266,19 +266,21 @@
                 <tr><td><code>question_text</code> / <code>question</code> / <code>q</code></td><td>Main prompt text.</td></tr>
                 <tr><td><code>answer</code> / <code>a</code></td><td>Legacy single-answer column.</td></tr>
                 <tr><td><code>answer-*</code></td><td>Labeled answer variants such as <code>answer-capital</code>.</td></tr>
-                <tr><td><code>type</code></td><td>Question type, commonly Text, Image, or Audio in CSV imports.</td></tr>
+                <tr><td><code>type</code></td><td>Optional override. If omitted, the importer infers the question type from media, options, prompt, and answer values.</td></tr>
                 <tr><td><code>difficulty</code> / <code>diff</code></td><td><code>easy</code>, <code>medium</code>, or <code>hard</code>.</td></tr>
                 <tr><td><code>subtopic</code> / <code>subtopic_hint</code></td><td>Subtopic grouping name.</td></tr>
                 <tr><td><code>explanation</code> / <code>explain</code></td><td>Explanation text for study and quiz views.</td></tr>
                 <tr><td><code>media</code> / <code>media_url</code></td><td>Image or audio URL. Required for CSV image rows.</td></tr>
+                <tr><td><code>options</code> / <code>choices</code> / <code>items</code> / <code>pairs</code></td><td>Required for <code>MCQ</code>, <code>MultiSelect</code>, and <code>Match</code> rows.</td></tr>
                 <tr><td><code>tags</code></td><td>Stored metadata.</td></tr>
               </tbody>
             </table>
           </div>
-          <pre>question_text,type,difficulty,subtopic,explanation,media,answer-capital,answer-currency
-India,Text,medium,Geography,Answer one requested field,,New Delhi,Rupee
-Identify this monument,Image,medium,Landmarks,Uses the supplied image,https://example.com/taj-mahal.jpg,Taj Mahal,
-Identify this anthem,Audio,medium,Culture,Listen and answer,https://example.com/audio.mp3,National Anthem,</pre>
+          <pre>question_text,difficulty,subtopic,explanation,media,options,answer
+Capital of France?,medium,Geography,Choose one,,"Paris,London,Berlin,Rome",Paris
+The sky is blue.,easy,Science,Answer true or false,,,True
+Identify this monument,medium,Landmarks,Uses the supplied image,https://example.com/taj-mahal.jpg,,Taj Mahal
+Identify this anthem,medium,Culture,Listen and answer,https://example.com/audio.mp3,,National Anthem</pre>
           <div class="callout info">
             <strong>ZIP image import:</strong> each image file becomes one Image question, the filename becomes the answer,
             and optional folders become subtopics. Example: <code>animals/tiger.jpg</code> imports answer <code>tiger</code>

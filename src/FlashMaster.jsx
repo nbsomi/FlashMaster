@@ -611,13 +611,18 @@ class ReviewQueue {
 // ══════════════════════════════════════════════════════════════
 const VALID_TYPES = ["Text","Image","MCQ","FillBlank","TrueFalse","Match","Order","Dictation","MultiSelect","Cloze","Audio"];
 const VALID_DIFF  = ["easy","medium","hard"];
+const VALID_TYPE_KEYS = new Set(VALID_TYPES.map(type => type.toLowerCase()));
+const VALID_TYPE_MAP = new Map(VALID_TYPES.map(type => [type.toLowerCase(), type]));
+const OPTION_REQUIRED_TYPES = new Set(["mcq","multiselect","match"]);
 const ZIP_IMAGE_FILE_RE = /\.(avif|bmp|gif|jpe?g|png|svg|webp)$/i;
+const AUDIO_FILE_RE = /\.(aac|flac|m4a|mp3|oga|ogg|wav|webm)(?:[?#].*)?$/i;
+const IMAGE_FILE_RE = /\.(avif|bmp|gif|jpe?g|png|svg|webp)(?:[?#].*)?$/i;
 const IMPORT_MODE_META = {
   csv: {
     label: "CSV + Media URLs",
     accept: ".csv,.txt,text/csv,text/plain",
     prompt: "Drop CSV or click to browse",
-    helper: "Image rows must include a media or media_url value.",
+    helper: "Type is optional. Image rows must include a media or media_url value.",
   },
   zip: {
     label: "ZIP Images",
@@ -634,15 +639,47 @@ function detectImportMode(file) {
   return "";
 }
 
+function splitOptionValues(options = "") {
+  return String(options || "").split(",").map(value => value.trim()).filter(Boolean);
+}
+
+function detectMediaKind(media = "") {
+  const value = String(media || "").trim().toLowerCase();
+  if (!value) return "";
+  if (value.startsWith("data:image/")) return "image";
+  if (value.startsWith("data:audio/")) return "audio";
+  if (IMAGE_FILE_RE.test(value)) return "image";
+  if (AUDIO_FILE_RE.test(value)) return "audio";
+  return "";
+}
+
+function inferQuestionType(question = {}) {
+  const rawType = String(question?.type || "").trim().toLowerCase();
+  const explicitType = VALID_TYPE_MAP.get(rawType) || "";
+  if (explicitType && explicitType !== "Text") return explicitType;
+
+  const mediaKind = detectMediaKind(question?.media);
+  if (mediaKind === "image") return "Image";
+  if (mediaKind === "audio") return "Audio";
+
+  const prompt = String(question?.question_text || question?.question || "").trim();
+  const promptLower = prompt.toLowerCase();
+  const answer = String(question?.answer || "").trim();
+  const answerParts = splitOptionValues(answer);
+  const options = String(question?.options || "").trim();
+  const optionValues = splitOptionValues(options);
+
+  if (prompt.includes("___")) return "Cloze";
+  if (/^(true|false)$/i.test(answer) && (!optionValues.length || optionValues.every(value => /^(true|false)$/i.test(value)))) return "TrueFalse";
+  if (optionValues.some(value => value.includes(":"))) return "Match";
+  if (/(arrange|order|sequence|sort)/i.test(promptLower) && (optionValues.length > 1 || answerParts.length > 1)) return "Order";
+  if (optionValues.length >= 2) return answerParts.length > 1 ? "MultiSelect" : "MCQ";
+  return explicitType || "Text";
+}
+
 function normalizeQuestionType(questionOrType, media = "") {
-  const rawType = typeof questionOrType === "string" ? questionOrType : questionOrType?.type;
-  const rawMedia = typeof questionOrType === "string" ? media : questionOrType?.media;
-  const type = String(rawType || "").trim().toLowerCase();
-  if (type === "image") return "Image";
-  if (type === "audio") return "Audio";
-  if (type === "text") return "Text";
-  if (!type && rawMedia) return "Image";
-  return rawType || "Text";
+  if (typeof questionOrType === "string") return inferQuestionType({ type: questionOrType, media });
+  return inferQuestionType(questionOrType);
 }
 
 function isImageQuestion(question) {
@@ -771,6 +808,7 @@ const CSV = {
     const qCol = [idx("question_text"), idx("question"), idx("q")].find(i => i >= 0);
     const aCol = [idx("answer"), idx("a")].find(i => i >= 0);
     const mediaCol = [idx("media"), idx("media_url"), idx("image_url")].find(i => i >= 0);
+    const optionsCol = [idx("options"), idx("choices"), idx("items"), idx("pairs")].find(i => i >= 0);
     const answerTypeCols = headers.map((header, index) =>
       header.startsWith("answer_") ? { key: header.slice(7), index } : null
     ).filter(Boolean);
@@ -787,8 +825,8 @@ const CSV = {
       const rawType = get(idx("type"));
       const rawDiff = (get(idx("difficulty")) || get(idx("diff")) || "medium").toLowerCase();
       const media = get(mediaCol);
+      const options = get(optionsCol);
       const normalizedCsvType = String(rawType || "").trim().toLowerCase();
-      const type = normalizeQuestionType(rawType || (media ? "Image" : "Text"), media);
       const diff = VALID_DIFF.includes(rawDiff) ? rawDiff : "medium";
       const answerVariants = answerTypeCols
         .map(col => {
@@ -806,15 +844,28 @@ const CSV = {
       if (!answerVariants.length && legacyAnswer) {
         answerVariants.push({ key:"answer", label:"Answer", value:legacyAnswer, isDefault:true });
       }
+      const inferredAnswer = answerVariants[0]?.value || legacyAnswer;
+      const rawQuestionText = get(qCol);
+      const type = normalizeQuestionType({
+        type: rawType,
+        media,
+        options,
+        question_text: rawQuestionText,
+        answer: inferredAnswer,
+      });
       if (type === "Image" && !media) {
         warnings.push(`Row ${li+2}: image question missing media URL — skipped`);
         return;
       }
-      const qt = get(qCol) || getMediaPrompt(type);
+      if (OPTION_REQUIRED_TYPES.has(normalizedCsvType) && !options) {
+        warnings.push(`Row ${li+2}: ${type} question missing options - skipped`);
+        return;
+      }
+      const qt = rawQuestionText || getMediaPrompt(type);
       if (!qt) { warnings.push(`Row ${li+2}: empty question — skipped`); return; }
       if (!answerVariants.length) { warnings.push(`Row ${li+2}: empty answer — skipped`); return; }
 
-      if (rawType && !["text","image","audio"].includes(normalizedCsvType))
+      if (rawType && !VALID_TYPE_KEYS.has(normalizedCsvType))
         warnings.push(`Row ${li+2}: unknown type "${rawType}" → defaulted to ${type}`);
 
       const primaryAnswer = answerVariants[0];
@@ -824,7 +875,7 @@ const CSV = {
         answerTypeKey:   primaryAnswer.key,
         answerTypeLabel: primaryAnswer.label,
         answerVariants,
-        options:         "",
+        options,
         type,
         difficulty:      diff,
         tags:            get(idx("tags")),
@@ -2047,11 +2098,23 @@ function QuestionRenderer({ question, userAnswer, onAnswer, checked, reverseMode
 
   const opts = (q.options || "").split(",").map(s => s.trim()).filter(Boolean);
   const effectiveType = opts.length < 2 && ["MCQ","MultiSelect"].includes(q.type) ? "FillBlank" : q.type;
+  const missingInteractiveOptions = !reverseMode && (
+    (["MCQ","MultiSelect"].includes(q.type) && opts.length < 2) ||
+    (q.type === "Match" && opts.length < 1)
+  );
 
   function handleText(val) { setText(val); onAnswer(val); }
   function startListen() {
     setListening(true);
     Speech.listen((t, c) => { handleText(t); setListening(false); }, () => setListening(false), ttsLang || "en-US");
+  }
+
+  if (missingInteractiveOptions) {
+    return (
+      <div style={{ background:"var(--accent)10", border:"1px solid var(--accent)30", borderRadius:12, padding:"12px 14px", fontSize:13, color:"var(--accent)" }}>
+        This {q.type} question is missing an <code>options</code> value in the imported data. Re-import it with an <code>options</code> column to use the interactive quiz layout.
+      </div>
+    );
   }
 
   // MCQ
@@ -2759,7 +2822,7 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
             </div>
             <div style={{ fontWeight:700, fontSize:15, marginBottom:8 }}>{modeMeta.prompt}</div>
             <div style={{ fontSize:12, color:"var(--muted)", marginBottom:8 }}>{modeMeta.helper}</div>
-            {mode === "csv" && <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, type, difficulty, subtopic, explanation, media, media_url, answer-{"{answer-type}"}</div>}
+            {mode === "csv" && <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Columns: question_text, difficulty, subtopic, explanation, media, media_url, options, answer-{"{answer-type}"} (optional: type)</div>}
             {mode === "zip" && <div style={{ fontSize:12, color:"var(--muted)", marginBottom:16 }}>Optional folders become subtopics. Example: <code>Fruits/Apple.jpg</code> imports answer <code>Apple</code> under subtopic <code>Fruits</code>.</div>}
             <button className="btn btn-primary btn-lg" type="button" onClick={() => fileInputRef.current?.click()}>
               {mode === "zip" ? "Choose ZIP" : "Choose File"}
@@ -2777,9 +2840,10 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
           <div className="card" style={{ marginTop:16, padding:14, display: mode === "csv" ? "block" : "none" }}>
             <div style={{ fontWeight:700, fontSize:13, marginBottom:8 }}>📋 CSV Format Example</div>
             <pre style={{ fontSize:11, color:"var(--muted)", overflow:"auto", fontFamily:"monospace", lineHeight:1.8 }}>{
-`question_text,type,difficulty,subtopic,explanation,media,answer-capital,answer-currency
-India,Text,medium,Geography,Answer one requested field,,New Delhi,Rupee
-Identify this monument,Image,medium,Landmarks,Uses the supplied image,https://example.com/taj-mahal.jpg,Taj Mahal,`
+`question_text,difficulty,subtopic,explanation,media,options,answer
+Capital of France?,medium,Geography,Choose one,,"Paris,London,Berlin,Rome",Paris
+The sky is blue.,easy,Science,Answer true or false,,,True
+Identify this monument,medium,Landmarks,Uses the supplied image,https://example.com/taj-mahal.jpg,,Taj Mahal`
             }</pre>
           </div>
           {mode === "zip" && (
@@ -3742,8 +3806,7 @@ function TopicsScreen() {
             </div>
             <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
               <button className="btn btn-primary btn-sm" onClick={()=>navigate("subtopics",{topicId:t.id,subjectId:nav.subjectId})}>Open</button>
-              {qs.length>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{topicId:t.id,subjectId:nav.subjectId,questionMode:"mixed"})}>Mixed Quiz</button>}
-              {textCount>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{topicId:t.id,subjectId:nav.subjectId,questionMode:"text"})}>Text Quiz</button>}
+              {qs.length>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{topicId:t.id,subjectId:nav.subjectId,questionMode:"mixed"})}>Quiz</button>}
               {imageCount>0&&<button className="btn btn-ghost btn-sm" onClick={()=>navigate("quiz",{topicId:t.id,subjectId:nav.subjectId,questionMode:"image"})}>Image Quiz</button>}
               <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm(`Delete "${t.name}"?`))deleteTopic(t.id);}}>🗑</button>
             </div>
