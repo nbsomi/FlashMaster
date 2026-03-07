@@ -2866,7 +2866,6 @@ function CSVImportModal({ subjectId, onClose, onImport }) {
             }}
             onDragLeave={e => {
               e.preventDefault();
-              if (e.currentTarget.contains(e.relatedTarget)) return;
               setDragActive(false);
             }}
             onDrop={handleDrop}
@@ -3826,7 +3825,7 @@ function SubjectsScreen() {
               <div style={{fontSize:12,color:"var(--muted)"}}>{s.language||"English"}</div>
             </div>
             <div style={{display:"flex",gap:6}}>
-              <button className="btn btn-ghost btn-sm" onClick={()=>setCSVSubId(s.id)} title="Import CSV">📥</button>
+              <button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation();setCSVSubId(s.id);}} title="Import CSV">📥</button>
               <button className="btn btn-ghost btn-sm" onClick={()=>navigate("topics",{subjectId:s.id})}>›</button>
               <button className="btn btn-ghost btn-sm" onClick={()=>{if(confirm(`Delete "${s.name}"?`))deleteSubject(s.id);}}>🗑</button>
             </div>
