@@ -865,8 +865,10 @@ function AppProvider({ children }) {
   });
   const [currentProfile, setCP]   = useState(null);
   const [screen,          setScreen]  = useState(() => {
-    // Always open the Google sign-in screen first.
-    return "google_login";
+    try {
+      const cached = JSON.parse(localStorage.getItem("fm_google_user") || "null");
+      return cached ? "profiles" : "google_login";
+    } catch { return "google_login"; }
   });
   const [nav,             setNav]     = useState({});
   const [toast,           setToast]   = useState(null);
@@ -1291,6 +1293,7 @@ function AppProvider({ children }) {
         setGdriveStatus("✅ Signed in (Drive pull skipped)");
       }
 
+      setScreen("profiles");
       showToast(`Welcome, ${user.name}! ✅`);
       return user;
     } catch (e) {
@@ -1307,6 +1310,11 @@ function AppProvider({ children }) {
     setCP(null);
     setScreen("google_login");
     if (!silent) showToast("Signed out");
+  }
+
+  async function googleSwitchAccount() {
+    GDrive.revokeToken();
+    return googleSignIn();
   }
 
   // ── Continuous auto-sync engine ────────────────────────────
@@ -1505,7 +1513,7 @@ function AppProvider({ children }) {
     getAccuracy, getWeakLessons, selectAdaptive, getTodayDP, showToast,
     // Google / Drive
     googleUser, googleClientId, gdriveSyncing, gdriveStatus, lastSyncedAt,
-    googleSignIn, googleSignOut,
+    googleSignIn, googleSignOut, googleSwitchAccount,
     syncProfileToDrive, restoreFromDrive,
     SRS, ReviewQueue, CSV, Speech, Crypto,
   };
@@ -2957,16 +2965,26 @@ function LeaderboardScreen() {
 // ══════════════════════════════════════════════════════════════
 function ProfilesScreen() {
   const { profiles, createProfile, deleteProfile, setCurrentProfile, navigate,
-          googleUser, gdriveSyncing, gdriveStatus, restoreFromDrive } = useApp();
+          googleUser, gdriveSyncing, gdriveStatus, restoreFromDrive, googleSwitchAccount } = useApp();
   const [modal,  setModal]  = useState(false);
   const [name,   setName]   = useState("");
   const [avatar, setAvatar] = useState(AVATARS[0]);
+  const [switchingGoogle, setSwitchingGoogle] = useState(false);
 
   async function create() {
     if (!name.trim()) return;
     const p = await createProfile(name.trim(), avatar);
     setCurrentProfile(p);
     navigate("dashboard");
+  }
+
+  async function handleSwitchGoogleAccount() {
+    setSwitchingGoogle(true);
+    try {
+      await googleSwitchAccount();
+    } finally {
+      setSwitchingGoogle(false);
+    }
   }
 
   return (
@@ -2980,7 +2998,8 @@ function ProfilesScreen() {
 
       {/* Signed-in user badge */}
       {googleUser && (
-        <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 16px",background:"rgba(99,102,241,.1)",border:"1px solid rgba(99,102,241,.25)",borderRadius:12,marginBottom:20,maxWidth:420,width:"100%"}}>
+        <div style={{padding:"12px 16px",background:"rgba(99,102,241,.1)",border:"1px solid rgba(99,102,241,.25)",borderRadius:12,marginBottom:20,maxWidth:420,width:"100%"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
           {googleUser.picture
             ? <img src={googleUser.picture} alt="" style={{width:32,height:32,borderRadius:"50%",flexShrink:0}} />
             : <div style={{width:32,height:32,borderRadius:"50%",background:"var(--primary)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,flexShrink:0}}>G</div>
@@ -2994,6 +3013,17 @@ function ProfilesScreen() {
               {gdriveStatus}
             </div>
           )}
+          </div>
+          <div style={{marginTop:12}}>
+            <button
+              className="btn btn-ghost btn-sm"
+              style={{width:"100%"}}
+              onClick={handleSwitchGoogleAccount}
+              disabled={switchingGoogle}
+            >
+              {switchingGoogle ? "Opening Google sign-in..." : "Use Another Google Account"}
+            </button>
+          </div>
         </div>
       )}
 
@@ -3068,26 +3098,12 @@ function ProfilesScreen() {
 // §21b  GOOGLE LOGIN SCREEN (mandatory first screen)
 // ══════════════════════════════════════════════════════════════
 function GoogleLoginScreen() {
-  const {
-    navigate,
-    googleUser, googleClientId,
-    googleSignIn, googleSignOut,
-  } = useApp();
+  const { googleClientId, googleSignIn } = useApp();
   const [signing, setSigning] = useState(false);
 
   async function handleSignIn() {
     setSigning(true);
     try {
-      await googleSignIn();
-    } finally {
-      setSigning(false);
-    }
-  }
-
-  async function handleNewUserLogin() {
-    setSigning(true);
-    try {
-      googleSignOut(true);
       await googleSignIn();
     } finally {
       setSigning(false);
@@ -3116,103 +3132,31 @@ function GoogleLoginScreen() {
       </div>
 
       <div className="card" style={{width:"100%",maxWidth:460,padding:30}}>
-        {googleUser ? (
-          <>
-            <div style={{fontSize:11,fontWeight:800,color:"var(--muted)",textTransform:"uppercase",letterSpacing:.7,marginBottom:8}}>
-              Signed In With Google
-            </div>
-            <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:26,letterSpacing:-.5,marginBottom:8}}>
-              Welcome back
-            </div>
-            <div style={{fontSize:14,color:"var(--muted)",lineHeight:1.55,marginBottom:18}}>
-              Continue with this account or sign in with another Google account.
-            </div>
+        <div style={{fontSize:11,fontWeight:800,color:"var(--muted)",textTransform:"uppercase",letterSpacing:.7,marginBottom:8}}>
+          Account Access
+        </div>
+        <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:26,letterSpacing:-.5,marginBottom:8}}>
+          Sign in to continue
+        </div>
+        <div style={{fontSize:14,color:"var(--muted)",lineHeight:1.55,marginBottom:22}}>
+          Use your Google account to access Flash Master.
+        </div>
 
-            <div style={{
-              display:"flex",alignItems:"center",gap:14,marginBottom:18,
-              padding:"16px 16px",background:"var(--surface)",border:"1px solid var(--border)",borderRadius:16,
-            }}>
-              {googleUser.picture ? (
-                <img src={googleUser.picture} alt="" style={{width:56,height:56,borderRadius:"50%",border:"2px solid var(--primary)",flexShrink:0}} />
-              ) : (
-                <div style={{
-                  width:56,height:56,borderRadius:"50%",background:"var(--card)",
-                  border:"1px solid var(--border)",display:"flex",alignItems:"center",
-                  justifyContent:"center",fontWeight:900,fontSize:22,color:"var(--primary)",flexShrink:0,
-                }}>
-                  {googleUser.name?.[0] || "G"}
-                </div>
-              )}
-              <div style={{minWidth:0}}>
-                <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:20,marginBottom:4}}>
-                  {googleUser.name}
-                </div>
-                <div style={{fontSize:13,color:"var(--muted)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                  {googleUser.email}
-                </div>
-              </div>
-            </div>
-
-            <div style={{height:1,background:"var(--border)",margin:"0 0 18px"}} />
-
-            <div style={{display:"grid",gap:10}}>
-              <button
-                className="btn btn-primary btn-lg"
-                style={{width:"100%"}}
-                onClick={()=>navigate("profiles")}
-              >
-                Load Profile Details
-              </button>
-              <button
-                className="btn btn-ghost btn-lg"
-                style={{width:"100%",gap:10}}
-                onClick={handleNewUserLogin}
-                disabled={!googleClientId || signing}
-              >
-                {signing ? (
-                  <span style={{display:"flex",alignItems:"center",gap:8}}>
-                    <span style={{display:"inline-block",width:16,height:16,border:"2px solid rgba(148,163,184,.4)",borderTopColor:"currentColor",borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>
-                    Opening Google sign-in...
-                  </span>
-                ) : (
-                  "Use Another Google Account"
-                )}
-              </button>
-            </div>
-          </>
-        ) : (
-          <>
-            <div style={{fontSize:11,fontWeight:800,color:"var(--muted)",textTransform:"uppercase",letterSpacing:.7,marginBottom:8}}>
-              Account Access
-            </div>
-            <div style={{fontFamily:"var(--syne)",fontWeight:800,fontSize:26,letterSpacing:-.5,marginBottom:8}}>
-              Sign in to continue
-            </div>
-            <div style={{fontSize:14,color:"var(--muted)",lineHeight:1.55,marginBottom:22}}>
-              Use your Google account to access Flash Master.
-            </div>
-
-            <button
-              className="btn btn-primary btn-lg"
-              style={{width:"100%",gap:12,fontSize:15}}
-              onClick={handleSignIn}
-              disabled={!googleClientId || signing}
-            >
-              {signing ? (
-                <span style={{display:"flex",alignItems:"center",gap:8}}>
-                  <span style={{display:"inline-block",width:16,height:16,border:"2px solid rgba(255,255,255,.3)",borderTopColor:"white",borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>
-                  Signing in...
-                </span>
-              ) : (
-                <><GoogleLogo /> Sign in with Google</>
-              )}
-            </button>
-
-            <div style={{fontSize:12,color:"var(--muted)",marginTop:14}}>
-              You can switch accounts later.
-            </div>
-          </>
-        )}
+        <button
+          className="btn btn-primary btn-lg"
+          style={{width:"100%",gap:12,fontSize:15}}
+          onClick={handleSignIn}
+          disabled={!googleClientId || signing}
+        >
+          {signing ? (
+            <span style={{display:"flex",alignItems:"center",gap:8}}>
+              <span style={{display:"inline-block",width:16,height:16,border:"2px solid rgba(255,255,255,.3)",borderTopColor:"white",borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>
+              Signing in...
+            </span>
+          ) : (
+            <><GoogleLogo /> Sign in with Google</>
+          )}
+        </button>
       </div>
 
       <style>{`
