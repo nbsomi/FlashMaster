@@ -1284,15 +1284,12 @@ function AppProvider({ children }) {
           ]);
           setProfiles(p); setSubjects(allS); setTopics(allT); setSubtopics(allST);
           setQuestions(allQ); setFlashProg(allFP); setQA(allQA); setLB(allLB); setRH(allRH);
-          setGdriveStatus(`✅ ${results.length} profile(s) loaded from Drive`);
-        } else {
-          setGdriveStatus("✅ Signed in — no Drive profiles yet");
         }
       } catch (e) {
         console.warn("[FM5.1] Drive pull on login:", e.message);
-        setGdriveStatus("✅ Signed in (Drive pull skipped)");
       }
 
+      setGdriveStatus("");
       setScreen("profiles");
       showToast(`Welcome, ${user.name}! ✅`);
       return user;
