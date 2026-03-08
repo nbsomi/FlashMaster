@@ -68,7 +68,25 @@ async function loadGIS() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// §1c  GOOGLE DRIVE ENGINE
+// §1c  PUTER.JS LOADER  — loads puter.js from CDN for AI TTS
+// ══════════════════════════════════════════════════════════════
+let _puterReady = null;
+async function loadPuter() {
+  if (window.puter) return window.puter;
+  if (_puterReady) return _puterReady;
+  _puterReady = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://js.puter.com/v2/";
+    s.async = true;
+    s.onload  = () => resolve(window.puter);
+    s.onerror = () => { _puterReady = null; reject(new Error("puter.js failed to load")); };
+    document.head.appendChild(s);
+  });
+  return _puterReady;
+}
+
+// ══════════════════════════════════════════════════════════════
+// §1d  GOOGLE DRIVE ENGINE
 // ══════════════════════════════════════════════════════════════
 const GDrive = {
   _accessToken    : null,
@@ -1326,38 +1344,48 @@ function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// §6  SPEECH ENGINE  — with WebKit fallback + pronunciation scoring
+// §6  SPEECH ENGINE  — puter.js AI TTS (primary) + WebKit fallback
 // ══════════════════════════════════════════════════════════════
 const Speech = {
-  _speakTimer : null,
-  _speakSeq   : 0,
-  _voices     : null,   // cached after first voiceschanged event
+  _speakTimer  : null,
+  _speakSeq    : 0,
+  _voices      : null,    // WebSpeech voice cache
+  _puterAudio  : null,    // currently-playing puter HTMLAudioElement
 
-  // ── Voice cache ───────────────────────────────────────────
-  // speechSynthesis.getVoices() returns [] synchronously on first call in
-  // most browsers; the real list fires via the voiceschanged event.
-  // We cache once and keep it for the lifetime of the page.
+  // ── Puter TTS (primary path) ──────────────────────────────
+  async _puterSpeak(text, onEnd, seq) {
+    try {
+      // puter.js may still be loading; wait for it
+      const puter = window.puter || await loadPuter();
+      if (seq !== this._speakSeq) return;
+      const audio = await puter.ai.txt2speech(text);
+      if (seq !== this._speakSeq) { try { audio.pause(); } catch {} return; }
+      this._puterAudio = audio;
+      audio.onended = () => {
+        if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); }
+      };
+      audio.onerror = () => {
+        if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); }
+      };
+      audio.play().catch(() => { if (seq === this._speakSeq) onEnd?.(); });
+    } catch (e) {
+      console.warn("[FM] puter TTS error — falling back to WebSpeech:", e?.message || e);
+      if (seq === this._speakSeq) this._webSpeechSpeak(text, "en-US", 1, onEnd, seq);
+    }
+  },
+
+  // ── WebSpeech fallback ────────────────────────────────────
   _ensureVoices() {
     if (this._voices?.length) return;
     if (!window.speechSynthesis?.getVoices) return;
     const list = window.speechSynthesis.getVoices();
     if (list.length) { this._voices = list; return; }
-    // Register a one-shot listener for async voice load
     if (!this._voiceListenerAttached) {
       this._voiceListenerAttached = true;
       window.speechSynthesis.onvoiceschanged = () => {
         this._voices = window.speechSynthesis.getVoices();
       };
     }
-  },
-
-  _normalizeSpeakText(text) {
-    const value = String(text || "").replace(/\s+/g, " ").trim();
-    if (!value) return "";
-    // Append a comma so the engine registers a pause boundary and speaks the
-    // full word rather than clipping the tail.  Applies to ALL text (not just
-    // single words) because it is harmless for multi-word strings too.
-    return `${value},`;
   },
 
   _pickVoice(lang) {
@@ -1372,24 +1400,15 @@ const Speech = {
 
   _buildUtterance(text, lang, rate = 1, volume = 1) {
     const u = new SpeechSynthesisUtterance(text);
-    u.lang   = lang;
-    u.rate   = rate;
-    u.volume = volume;
+    u.lang = lang; u.rate = rate; u.volume = volume;
     const voice = this._pickVoice(lang);
     if (voice) u.voice = voice;
     return u;
   },
 
-  speak(text, lang = "en-US", rate = 1, onEnd = null) {
-    if (!window.speechSynthesis) return;
+  _webSpeechSpeak(text, lang, rate, onEnd, seq) {
+    if (!window.speechSynthesis) { onEnd?.(); return; }
     const synth = window.speechSynthesis;
-    const spokenText = this._normalizeSpeakText(text);
-    if (!spokenText) { onEnd?.(); return; }
-
-    // ── Stop everything in-flight ────────────────────────────────────────
-    if (this._speakTimer) { clearTimeout(this._speakTimer); this._speakTimer = null; }
-    this._speakSeq += 1;
-    const seq = this._speakSeq;
     synth.cancel();
 
     const queue = (fn, delay) => {
@@ -1402,32 +1421,12 @@ const Speech = {
 
     const speakMain = () => {
       if (seq !== this._speakSeq) return;
-      const u = this._buildUtterance(spokenText, lang, rate, 1);
+      const u = this._buildUtterance(text, lang, rate, 1);
       u.onend  = () => { if (seq === this._speakSeq) onEnd?.(); };
-      // "interrupted" fires when cancel() is called on an active utterance.
-      // We must NOT invoke onEnd then — the next speak() call has taken over.
       u.onerror = e => { if (e?.error !== "interrupted" && seq === this._speakSeq) onEnd?.(); };
-      synth.speak(u);
-      synth.resume?.();
+      synth.speak(u); synth.resume?.();
     };
 
-    // ── Warm-up primer ───────────────────────────────────────────────────
-    // iOS/Safari clips the first syllable because the audio session is not
-    // open yet.  A near-silent two-word utterance forces the session open.
-    //
-    // CRITICAL — primer must be multi-word ("a a", NOT "a"):
-    //   Single-word utterances are subject to the same first-syllable clipping
-    //   bug we are trying to work around.  A single-word primer is silently
-    //   swallowed on iOS, onend never fires, and speakMain is never called —
-    //   which was the root cause of complete silence on single-word cards.
-    //
-    // Volume 0.01: volume 0 causes WebKit to skip the utterance without
-    // firing onend/onerror.  0.01 is inaudible in practice (~−40 dB) but
-    // reliably produces events.
-    //
-    // Hard fallback timeout (1 000 ms): if onend/onerror both fail to fire
-    // (e.g. iOS locked screen, audio session forcibly closed by OS),
-    // speakMain is called anyway so the card doesn't stay forever silent.
     const primeAndSpeak = () => {
       if (seq !== this._speakSeq) return;
       let primerDone = false;
@@ -1437,21 +1436,61 @@ const Speech = {
         queue(speakMain, 200);
       };
       const primer = this._buildUtterance("a a", lang, 1, 0.01);
-      primer.onend   = afterPrimer;
-      primer.onerror = afterPrimer;
-      synth.speak(primer);
-      synth.resume?.();
-      // Hard fallback — fires if primer events never arrive
+      primer.onend = afterPrimer; primer.onerror = afterPrimer;
+      synth.speak(primer); synth.resume?.();
       window.setTimeout(() => { if (seq === this._speakSeq) afterPrimer(); }, 1000);
     };
 
-    // Wait 150 ms after cancel() so the browser fully clears its queue
     queue(primeAndSpeak, 150);
+  },
+
+  // ── Public API ────────────────────────────────────────────
+  _normalizeSpeakText(text) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    if (!value) return "";
+    return `${value},`;
+  },
+
+  speak(text, lang = "en-US", rate = 1, onEnd = null) {
+    const spokenText = this._normalizeSpeakText(text);
+    if (!spokenText) { onEnd?.(); return; }
+
+    // Stop everything in-flight
+    if (this._speakTimer) { clearTimeout(this._speakTimer); this._speakTimer = null; }
+    this._speakSeq += 1;
+    const seq = this._speakSeq;
+
+    // Cancel any live puter audio
+    if (this._puterAudio) {
+      try { this._puterAudio.pause(); } catch {}
+      this._puterAudio = null;
+    }
+    window.speechSynthesis?.cancel();
+
+    // puter.js takes priority; WebSpeech is the fallback
+    if (window.puter?.ai?.txt2speech) {
+      this._puterSpeak(spokenText, onEnd, seq);
+    } else {
+      // Try to load puter.js, fall back immediately if unavailable
+      loadPuter()
+        .then(() => {
+          if (seq !== this._speakSeq) return;
+          this._puterSpeak(spokenText, onEnd, seq);
+        })
+        .catch(() => {
+          if (seq !== this._speakSeq) return;
+          this._webSpeechSpeak(spokenText, lang, rate, onEnd, seq);
+        });
+    }
   },
 
   cancel() {
     if (this._speakTimer) { clearTimeout(this._speakTimer); this._speakTimer = null; }
     this._speakSeq += 1;
+    if (this._puterAudio) {
+      try { this._puterAudio.pause(); } catch {}
+      this._puterAudio = null;
+    }
     window.speechSynthesis?.cancel();
   },
 
@@ -1701,6 +1740,8 @@ function AppProvider({ children }) {
     (async () => {
       try {
         const db = await getDB(); // triggers Dexie open + migration
+        // Pre-load puter.js in parallel so TTS is ready immediately
+        loadPuter().catch(() => {/* puter unavailable — WebSpeech will be used */});
         const [p, allSubjects, allTopics, allSubtopics, q, allProgress, allQA, lb, allRH] = await Promise.all([
           db.profiles.toArray(),
           db.subjects.toArray(),
