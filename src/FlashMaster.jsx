@@ -1329,35 +1329,53 @@ function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
 // §6  SPEECH ENGINE  — with WebKit fallback + pronunciation scoring
 // ══════════════════════════════════════════════════════════════
 const Speech = {
-  _speakTimer: null,
-  _speakSeq: 0,
+  _speakTimer : null,
+  _speakSeq   : 0,
+  _voices     : null,   // cached after first voiceschanged event
+
+  // ── Voice cache ───────────────────────────────────────────
+  // speechSynthesis.getVoices() returns [] synchronously on first call in
+  // most browsers; the real list fires via the voiceschanged event.
+  // We cache once and keep it for the lifetime of the page.
+  _ensureVoices() {
+    if (this._voices?.length) return;
+    if (!window.speechSynthesis?.getVoices) return;
+    const list = window.speechSynthesis.getVoices();
+    if (list.length) { this._voices = list; return; }
+    // Register a one-shot listener for async voice load
+    if (!this._voiceListenerAttached) {
+      this._voiceListenerAttached = true;
+      window.speechSynthesis.onvoiceschanged = () => {
+        this._voices = window.speechSynthesis.getVoices();
+      };
+    }
+  },
 
   _normalizeSpeakText(text) {
     const value = String(text || "").replace(/\s+/g, " ").trim();
     if (!value) return "";
-    // Single words get a comma+period so the TTS engine registers a natural
-    // pause and speaks the whole word instead of cutting the tail off.
-    return value.includes(" ") ? value : `${value},`;
+    // Append a comma so the engine registers a pause boundary and speaks the
+    // full word rather than clipping the tail.  Applies to ALL text (not just
+    // single words) because it is harmless for multi-word strings too.
+    return `${value},`;
   },
 
   _pickVoice(lang) {
-    if (!window.speechSynthesis?.getVoices) return null;
-    const voices = window.speechSynthesis.getVoices() || [];
+    this._ensureVoices();
+    const voices = this._voices || [];
     if (!voices.length) return null;
-
-    const exact = voices.find(voice => voice.lang === lang);
+    const exact = voices.find(v => v.lang === lang);
     if (exact) return exact;
-
     const base = lang.split("-")[0]?.toLowerCase();
-    return voices.find(voice => voice.lang?.toLowerCase().startsWith(base)) || null;
+    return voices.find(v => v.lang?.toLowerCase().startsWith(base)) || null;
   },
 
   _buildUtterance(text, lang, rate = 1, volume = 1) {
     const u = new SpeechSynthesisUtterance(text);
-    const voice = this._pickVoice(lang);
-    u.lang = lang;
-    u.rate = rate;
+    u.lang   = lang;
+    u.rate   = rate;
     u.volume = volume;
+    const voice = this._pickVoice(lang);
     if (voice) u.voice = voice;
     return u;
   },
@@ -1368,11 +1386,11 @@ const Speech = {
     const spokenText = this._normalizeSpeakText(text);
     if (!spokenText) { onEnd?.(); return; }
 
-    // ── Stop everything in-flight (single cancel, one seq bump) ──────────
+    // ── Stop everything in-flight ────────────────────────────────────────
     if (this._speakTimer) { clearTimeout(this._speakTimer); this._speakTimer = null; }
     this._speakSeq += 1;
     const seq = this._speakSeq;
-    synth.cancel();                    // clear browser queue exactly once
+    synth.cancel();
 
     const queue = (fn, delay) => {
       this._speakTimer = window.setTimeout(() => {
@@ -1385,35 +1403,49 @@ const Speech = {
     const speakMain = () => {
       if (seq !== this._speakSeq) return;
       const u = this._buildUtterance(spokenText, lang, rate, 1);
-      u.onend = () => { if (seq === this._speakSeq) onEnd?.(); };
-      // Filter "interrupted" — fired when cancel() is called mid-speech.
-      // We must NOT invoke onEnd for an interrupted utterance; the next
-      // speak() call has already taken over.
+      u.onend  = () => { if (seq === this._speakSeq) onEnd?.(); };
+      // "interrupted" fires when cancel() is called on an active utterance.
+      // We must NOT invoke onEnd then — the next speak() call has taken over.
       u.onerror = e => { if (e?.error !== "interrupted" && seq === this._speakSeq) onEnd?.(); };
       synth.speak(u);
       synth.resume?.();
     };
 
-    // ── Warm-up primer ────────────────────────────────────────────────────
-    // iOS/Safari clips the first word because the audio session is not yet
-    // open when speech starts.  A near-silent utterance of the actual phoneme
-    // "a" forces the session open.  Volume 0.01 is required: volume 0 causes
-    // WebKit to skip the utterance entirely without firing onend/onerror.
-    // "." and other punctuation-only strings have no phonetic content and are
-    // silently dropped by many engines without firing any events.
-    // 200 ms post-primer gap is the minimum reliable pipeline warm-up time.
+    // ── Warm-up primer ───────────────────────────────────────────────────
+    // iOS/Safari clips the first syllable because the audio session is not
+    // open yet.  A near-silent two-word utterance forces the session open.
+    //
+    // CRITICAL — primer must be multi-word ("a a", NOT "a"):
+    //   Single-word utterances are subject to the same first-syllable clipping
+    //   bug we are trying to work around.  A single-word primer is silently
+    //   swallowed on iOS, onend never fires, and speakMain is never called —
+    //   which was the root cause of complete silence on single-word cards.
+    //
+    // Volume 0.01: volume 0 causes WebKit to skip the utterance without
+    // firing onend/onerror.  0.01 is inaudible in practice (~−40 dB) but
+    // reliably produces events.
+    //
+    // Hard fallback timeout (1 000 ms): if onend/onerror both fail to fire
+    // (e.g. iOS locked screen, audio session forcibly closed by OS),
+    // speakMain is called anyway so the card doesn't stay forever silent.
     const primeAndSpeak = () => {
       if (seq !== this._speakSeq) return;
-      const primer = this._buildUtterance("a", lang, 1, 0.01);
-      primer.onend   = () => queue(speakMain, 200);
-      primer.onerror = () => queue(speakMain, 200);
+      let primerDone = false;
+      const afterPrimer = () => {
+        if (primerDone) return;
+        primerDone = true;
+        queue(speakMain, 200);
+      };
+      const primer = this._buildUtterance("a a", lang, 1, 0.01);
+      primer.onend   = afterPrimer;
+      primer.onerror = afterPrimer;
       synth.speak(primer);
       synth.resume?.();
+      // Hard fallback — fires if primer events never arrive
+      window.setTimeout(() => { if (seq === this._speakSeq) afterPrimer(); }, 1000);
     };
 
-    // Always wait 150 ms after cancel() so the browser fully clears its queue
-    // before we enqueue the primer.  This covers both the "was busy" and
-    // "was idle" cases with a single unified code path.
+    // Wait 150 ms after cancel() so the browser fully clears its queue
     queue(primeAndSpeak, 150);
   },
 
