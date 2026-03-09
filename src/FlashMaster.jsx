@@ -2836,7 +2836,7 @@ function QuestionRenderer({ question, userAnswer, onAnswer, checked, reverseMode
   // FillBlank / Dictation / Image / Audio
   return (
     <div>
-      {effectiveType === "Dictation" && <button className="btn btn-accent" style={{ width:"100%", marginBottom:12, padding:16 }} onClick={() => Speech.speak(q.answer, ttsLang, ttsRate, null, ttsVoice, ttsPitch)}>🔊 Listen — type what you hear</button>}
+      {effectiveType === "Dictation" && <button className="btn btn-accent" style={{ width:"100%", marginBottom:12, padding:16 }} onClick={() => Speech.speak("." + q.answer, ttsLang, ttsRate, null, ttsVoice, ttsPitch)}>🔊 Listen — type what you hear</button>}
       {["Image","Audio"].includes(effectiveType) && <QuestionMedia question={q} />}
       {showHint && !checked && <div style={{ fontSize:13, color:"var(--accent)", fontWeight:700, marginBottom:8 }}>💡 Starts with: {q.answer[0]?.toUpperCase()}</div>}
       <div style={{ display:"flex", gap:8 }}>
@@ -2978,7 +2978,7 @@ function RepeatAfterMe({ text, lang, tolerance }) {
   const [phase, setPhase]   = useState("idle");
   const [result, setResult] = useState(null);
 
-  function play()   { setPhase("playing"); Speech.speak(text, lang, 0.85, () => setPhase("idle")); }
+  function play()   { setPhase("playing"); Speech.speak("." + text, lang, 0.85, () => setPhase("idle")); }
   function listen() {
     setPhase("listening");
     Speech.listen((spoken, conf) => {
@@ -3087,7 +3087,7 @@ function FlashScreen() {
   useEffect(() => {
     if (!studyCurrent || !settings.autoTTS || isDone) return;
     if (!settings.ttsReadQuestion) return;
-    const t = setTimeout(() => Speech.speak(reverseMode ? studyCurrent.answer : questionPrompt, settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch, settings.ttsVolume), settings.ttsDelay ?? 300);
+    const t = setTimeout(() => Speech.speak("." + (reverseMode ? studyCurrent.answer : questionPrompt), settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch, settings.ttsVolume), settings.ttsDelay ?? 300);
     return () => { clearTimeout(t); Speech.cancel(); };
   }, [idx, reverseMode, rep, settings.autoTTS]);
 
@@ -3243,7 +3243,7 @@ function FlashScreen() {
                 <div>{reverseMode ? questionPrompt : studyCurrent.answer}</div>
               </div>
               <div style={{ display:"flex", gap:8, marginTop:12 }}>
-                <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); Speech.speak(reverseMode ? questionPrompt : studyCurrent.answer, settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch, settings.ttsVolume); }}>🔊</button>
+                <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); Speech.speak("." + (reverseMode ? questionPrompt : studyCurrent.answer), settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch, settings.ttsVolume); }}>🔊</button>
                 {settings.repeatAfterMe && <button className="btn btn-ghost btn-sm" style={{ color:"var(--accent)" }} onClick={e => { e.stopPropagation(); setShowRepeat(r => !r); }}>🎙️</button>}
               </div>
               {showRepeat && settings.repeatAfterMe && (
@@ -3607,7 +3607,7 @@ function QuizScreen() {
   const current = qList[qi];
 
   useEffect(() => { setUa(""); setChk(false); setTL(settings.timerSec || 30); }, [qi]);
-  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak(getQuestionLabel(current), settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch, settings.ttsVolume); }, [qi, settings.autoTTS]);
+  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak("." + getQuestionLabel(current), settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch, settings.ttsVolume); }, [qi, settings.autoTTS]);
 
   useEffect(() => {
     if (!settings.timerSec || checked || done || !current) return;
@@ -4142,7 +4142,7 @@ function SettingsScreen() {
             <Row label="Preview">
               <div style={{ display:"flex", gap:8 }}>
                 <button className="btn btn-ghost btn-sm"
-                  onClick={() => Speech.speak("This is a voice preview.", s.ttsLang, s.ttsRate, null, s.ttsVoice, s.ttsPitch, s.ttsVolume)}>
+                  onClick={() => Speech.speak(".This is a voice preview.", s.ttsLang, s.ttsRate, null, s.ttsVoice, s.ttsPitch, s.ttsVolume)}>
                   🔊 Test
                 </button>
                 <button className="btn btn-ghost btn-sm" onClick={() => Speech.cancel()}>⏹ Stop</button>
