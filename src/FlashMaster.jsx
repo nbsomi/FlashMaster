@@ -68,25 +68,7 @@ async function loadGIS() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// §1c  PUTER.JS LOADER  — loads puter.js from CDN for AI TTS
-// ══════════════════════════════════════════════════════════════
-let _puterReady = null;
-async function loadPuter() {
-  if (window.puter) return window.puter;
-  if (_puterReady) return _puterReady;
-  _puterReady = new Promise((resolve, reject) => {
-    const s = document.createElement("script");
-    s.src = "https://js.puter.com/v2/";
-    s.async = true;
-    s.onload  = () => resolve(window.puter);
-    s.onerror = () => { _puterReady = null; reject(new Error("puter.js failed to load")); };
-    document.head.appendChild(s);
-  });
-  return _puterReady;
-}
-
-// ══════════════════════════════════════════════════════════════
-// §1d  GOOGLE DRIVE ENGINE
+// §1c  GOOGLE DRIVE ENGINE
 // ══════════════════════════════════════════════════════════════
 const GDrive = {
   _accessToken    : null,
@@ -1364,7 +1346,7 @@ function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// §6  SPEECH ENGINE  — WebSpeech API (SpeechSynthesis)
+// §6  SPEECH ENGINE  — WebSpeech API (SpeechSynthesis + SpeechRecognition)
 // ══════════════════════════════════════════════════════════════
 const Speech = {
   _seq         : 0,       // cancellation token — incremented on every speak/cancel
@@ -1621,8 +1603,17 @@ function dayStr(d = new Date()) { return d.toISOString().slice(0, 10); }
 const DEFAULT_SETTINGS = {
   // General
   theme: "dark", fontSize: "medium", uiLang: "en", hapticFeedback: true, focusMode: false,
-  // TTS / Voice
-  autoTTS: true, ttsLang: "en-US", ttsRate: 1.0, ttsVoice: "", ttsPitch: 1.0,
+  // TTS / Voice — core
+  autoTTS: true, ttsLang: "en-US", ttsRate: 1.0, ttsVoice: "", ttsPitch: 1.0, ttsVolume: 1.0,
+  // TTS / Voice — behaviour
+  ttsAutoAnswer: false,       // also speak the answer/back side automatically
+  ttsOnQuizCheck: true,       // speak correct answer after quiz check
+  ttsReadQuestion: true,      // speak question text (front side)
+  ttsReadOptions: false,      // also read MCQ option labels aloud
+  ttsDelay: 300,              // ms delay before auto-speak fires (0–2000)
+  // Recognition
+  recogLang: "",              // "" = follow ttsLang; override independently
+  // Repeat-after-me / scoring
   repeatAfterMe: false, voiceScoring: true, accentTolerance: 0.70,
   // Learning
   spacedRepetition: true, smartShuffle: true, repetitionCount: 3,
@@ -1718,7 +1709,6 @@ function AppProvider({ children }) {
     (async () => {
       try {
         const db = await getDB(); // triggers Dexie open + migration
-        // Pre-load voices so the list is ready by the time user opens Voice settings
         const [p, allSubjects, allTopics, allSubtopics, q, allProgress, allQA, lb, allRH] = await Promise.all([
           db.profiles.toArray(),
           db.subjects.toArray(),
@@ -3096,7 +3086,8 @@ function FlashScreen() {
   // TTS
   useEffect(() => {
     if (!studyCurrent || !settings.autoTTS || isDone) return;
-    const t = setTimeout(() => Speech.speak(reverseMode ? studyCurrent.answer : questionPrompt, settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch), 300);
+    if (!settings.ttsReadQuestion) return;
+    const t = setTimeout(() => Speech.speak(reverseMode ? studyCurrent.answer : questionPrompt, settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch, settings.ttsVolume), settings.ttsDelay ?? 300);
     return () => { clearTimeout(t); Speech.cancel(); };
   }, [idx, reverseMode, rep, settings.autoTTS]);
 
@@ -3252,7 +3243,7 @@ function FlashScreen() {
                 <div>{reverseMode ? questionPrompt : studyCurrent.answer}</div>
               </div>
               <div style={{ display:"flex", gap:8, marginTop:12 }}>
-                <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); Speech.speak(reverseMode ? questionPrompt : studyCurrent.answer, settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch); }}>🔊</button>
+                <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); Speech.speak(reverseMode ? questionPrompt : studyCurrent.answer, settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch, settings.ttsVolume); }}>🔊</button>
                 {settings.repeatAfterMe && <button className="btn btn-ghost btn-sm" style={{ color:"var(--accent)" }} onClick={e => { e.stopPropagation(); setShowRepeat(r => !r); }}>🎙️</button>}
               </div>
               {showRepeat && settings.repeatAfterMe && (
@@ -3616,7 +3607,7 @@ function QuizScreen() {
   const current = qList[qi];
 
   useEffect(() => { setUa(""); setChk(false); setTL(settings.timerSec || 30); }, [qi]);
-  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak(getQuestionLabel(current), settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch); }, [qi, settings.autoTTS]);
+  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak(getQuestionLabel(current), settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch, settings.ttsVolume); }, [qi, settings.autoTTS]);
 
   useEffect(() => {
     if (!settings.timerSec || checked || done || !current) return;
@@ -4026,93 +4017,161 @@ function SettingsScreen() {
           <Row label="Repetition Rounds"><Slide k="repetitionCount" min={1} max={6} /></Row>
         </>)}
         {sec==="voice" && (()=>{
-          // Build the voice list reactively inside the settings render.
-          // We re-read on every render so newly-loaded voices appear without
-          // requiring a page reload (Chrome loads voices async).
+          // All BCP-47 language tags with broad WebSpeech coverage, with country flags.
+          const ALL_LANGS = [
+            // English variants
+            ["en-US","🇺🇸 English (US)"],["en-GB","🇬🇧 English (UK)"],
+            ["en-AU","🇦🇺 English (Australia)"],["en-CA","🇨🇦 English (Canada)"],
+            ["en-IN","🇮🇳 English (India)"],["en-IE","🇮🇪 English (Ireland)"],
+            ["en-ZA","🇿🇦 English (South Africa)"],["en-NZ","🇳🇿 English (New Zealand)"],
+            // Indian subcontinent
+            ["hi-IN","🇮🇳 Hindi"],["bn-IN","🇮🇳 Bengali (India)"],["bn-BD","🇧🇩 Bengali (Bangladesh)"],
+            ["ta-IN","🇮🇳 Tamil (India)"],["ta-LK","🇱🇰 Tamil (Sri Lanka)"],
+            ["te-IN","🇮🇳 Telugu"],["ml-IN","🇮🇳 Malayalam"],["kn-IN","🇮🇳 Kannada"],
+            ["mr-IN","🇮🇳 Marathi"],["gu-IN","🇮🇳 Gujarati"],["pa-IN","🇮🇳 Punjabi (India)"],
+            ["ur-PK","🇵🇰 Urdu (Pakistan)"],["ur-IN","🇮🇳 Urdu (India)"],
+            ["si-LK","🇱🇰 Sinhala"],["ne-NP","🇳🇵 Nepali"],
+            // East Asia
+            ["zh-CN","🇨🇳 Chinese (Mainland)"],["zh-TW","🇹🇼 Chinese (Taiwan)"],
+            ["zh-HK","🇭🇰 Chinese (Hong Kong)"],["ja-JP","🇯🇵 Japanese"],
+            ["ko-KR","🇰🇷 Korean"],["mn-MN","🇲🇳 Mongolian"],
+            // Southeast Asia
+            ["id-ID","🇮🇩 Indonesian"],["ms-MY","🇲🇾 Malay (Malaysia)"],
+            ["ms-BN","🇧🇳 Malay (Brunei)"],["th-TH","🇹🇭 Thai"],
+            ["vi-VN","🇻🇳 Vietnamese"],["fil-PH","🇵🇭 Filipino"],
+            ["km-KH","🇰🇭 Khmer"],["lo-LA","🇱🇦 Lao"],["my-MM","🇲🇲 Burmese"],
+            // Middle East & Central Asia
+            ["ar-SA","🇸🇦 Arabic (Saudi)"],["ar-EG","🇪🇬 Arabic (Egypt)"],
+            ["ar-AE","🇦🇪 Arabic (UAE)"],["ar-MA","🇲🇦 Arabic (Morocco)"],
+            ["ar-IQ","🇮🇶 Arabic (Iraq)"],["ar-LB","🇱🇧 Arabic (Lebanon)"],
+            ["fa-IR","🇮🇷 Persian (Farsi)"],["he-IL","🇮🇱 Hebrew"],
+            ["tr-TR","🇹🇷 Turkish"],["az-AZ","🇦🇿 Azerbaijani"],
+            ["kk-KZ","🇰🇿 Kazakh"],["ky-KG","🇰🇬 Kyrgyz"],["uz-UZ","🇺🇿 Uzbek"],
+            // Europe — Romance
+            ["fr-FR","🇫🇷 French (France)"],["fr-BE","🇧🇪 French (Belgium)"],
+            ["fr-CA","🇨🇦 French (Canada)"],["fr-CH","🇨🇭 French (Switzerland)"],
+            ["es-ES","🇪🇸 Spanish (Spain)"],["es-MX","🇲🇽 Spanish (Mexico)"],
+            ["es-US","🇺🇸 Spanish (US)"],["es-AR","🇦🇷 Spanish (Argentina)"],
+            ["es-CO","🇨🇴 Spanish (Colombia)"],["es-CL","🇨🇱 Spanish (Chile)"],
+            ["pt-BR","🇧🇷 Portuguese (Brazil)"],["pt-PT","🇵🇹 Portuguese (Portugal)"],
+            ["it-IT","🇮🇹 Italian"],["ro-RO","🇷🇴 Romanian"],["ca-ES","🇪🇸 Catalan"],
+            ["gl-ES","🇪🇸 Galician"],
+            // Europe — Germanic
+            ["de-DE","🇩🇪 German (Germany)"],["de-AT","🇦🇹 German (Austria)"],
+            ["de-CH","🇨🇭 German (Switzerland)"],["nl-NL","🇳🇱 Dutch (Netherlands)"],
+            ["nl-BE","🇧🇪 Dutch (Belgium)"],["sv-SE","🇸🇪 Swedish"],
+            ["nb-NO","🇳🇴 Norwegian (Bokmål)"],["da-DK","🇩🇰 Danish"],
+            ["fi-FI","🇫🇮 Finnish"],["is-IS","🇮🇸 Icelandic"],["af-ZA","🇿🇦 Afrikaans"],
+            // Europe — Slavic & others
+            ["ru-RU","🇷🇺 Russian"],["uk-UA","🇺🇦 Ukrainian"],["pl-PL","🇵🇱 Polish"],
+            ["cs-CZ","🇨🇿 Czech"],["sk-SK","🇸🇰 Slovak"],["bg-BG","🇧🇬 Bulgarian"],
+            ["hr-HR","🇭🇷 Croatian"],["sr-RS","🇷🇸 Serbian"],["sl-SI","🇸🇮 Slovenian"],
+            ["bs-BA","🇧🇦 Bosnian"],["mk-MK","🇲🇰 Macedonian"],["sq-AL","🇦🇱 Albanian"],
+            ["el-GR","🇬🇷 Greek"],["hu-HU","🇭🇺 Hungarian"],
+            ["lv-LV","🇱🇻 Latvian"],["lt-LT","🇱🇹 Lithuanian"],["et-EE","🇪🇪 Estonian"],
+            // Africa
+            ["sw-KE","🇰🇪 Swahili (Kenya)"],["sw-TZ","🇹🇿 Swahili (Tanzania)"],
+            ["am-ET","🇪🇹 Amharic"],["yo-NG","🇳🇬 Yoruba"],
+            ["ig-NG","🇳🇬 Igbo"],["ha-NG","🇳🇬 Hausa"],["zu-ZA","🇿🇦 Zulu"],
+          ];
+
           const allVoices  = Speech.getVoices();
           const langVoices = allVoices.filter(v => {
             const base = s.ttsLang.split("-")[0].toLowerCase();
             return v.lang === s.ttsLang || v.lang?.toLowerCase().startsWith(base);
           });
-          // Group by language for the "All voices" selector
-          const langGroups = allVoices.reduce((acc, v) => {
-            const g = v.lang || "Unknown";
-            if (!acc[g]) acc[g] = [];
-            acc[g].push(v);
-            return acc;
-          }, {});
+
+          const SliderRow = ({ label, sub, k, min, max, step=0.1, fmt }) => (
+            <Row label={label} sub={sub}>
+              <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                <input type="range" min={min} max={max} step={step} value={s[k]}
+                  onChange={e => set_(k, +e.target.value)} style={{ width:90 }} />
+                <span style={{ fontSize:13, fontWeight:700, color:"var(--primary)", width:48, textAlign:"right" }}>
+                  {fmt ? fmt(s[k]) : s[k]}
+                </span>
+              </div>
+            </Row>
+          );
+
+          const SubHead = ({ children }) => (
+            <div style={{ fontSize:11, fontWeight:800, color:"var(--muted)", textTransform:"uppercase",
+              letterSpacing:.8, padding:"16px 0 4px" }}>{children}</div>
+          );
 
           return (<>
-            <Row label="Auto TTS" sub="Read questions aloud automatically"><Tog k="autoTTS" /></Row>
+            {/* ── Playback behaviour ──────────────────── */}
+            <SubHead>Playback</SubHead>
+            <Row label="Auto TTS" sub="Read card automatically when it appears"><Tog k="autoTTS" /></Row>
+            <Row label="Read Question" sub="Speak the front / question side"><Tog k="ttsReadQuestion" /></Row>
+            <Row label="Read Answer" sub="Speak the back / answer side automatically"><Tog k="ttsAutoAnswer" /></Row>
+            <Row label="Speak after Quiz Check" sub="Read correct answer aloud after checking"><Tog k="ttsOnQuizCheck" /></Row>
+            <Row label="Read MCQ Options" sub="Speak each option label before you choose"><Tog k="ttsReadOptions" /></Row>
+            <SliderRow label="Auto-Speak Delay" sub="Pause before speaking fires (0 = instant)"
+              k="ttsDelay" min={0} max={2000} step={50} fmt={v => `${v} ms`} />
 
-            <Row label="TTS Language">
-              <select className="input" style={{ padding:"5px 10px", height:34, width:"auto" }}
+            {/* ── Voice ───────────────────────────────── */}
+            <SubHead>Voice</SubHead>
+            <Row label="Language">
+              <select className="input" style={{ padding:"5px 8px", height:34, width:"auto", maxWidth:230 }}
                 value={s.ttsLang}
                 onChange={e => { set_("ttsLang", e.target.value); set_("ttsVoice", ""); }}>
-                {[["en-US","🇺🇸 English (US)"],["en-GB","🇬🇧 English (UK)"],["hi-IN","🇮🇳 Hindi"],
-                  ["ta-IN","🇮🇳 Tamil"],["te-IN","🇮🇳 Telugu"],["fr-FR","🇫🇷 French"],
-                  ["de-DE","🇩🇪 German"],["es-ES","🇪🇸 Spanish"],["zh-CN","🇨🇳 Chinese"],
-                  ["ja-JP","🇯🇵 Japanese"],["ar-SA","🇸🇦 Arabic"],["ko-KR","🇰🇷 Korean"],
-                  ["pt-BR","🇧🇷 Portuguese"]].map(([v,l]) => <option key={v} value={v}>{l}</option>)}
+                {ALL_LANGS.map(([v,l]) => <option key={v} value={v}>{l}</option>)}
               </select>
             </Row>
 
-            <Row label="Voice" sub={langVoices.length ? `${langVoices.length} voice${langVoices.length>1?"s":""} available` : "No voices found — browser may still be loading"}>
-              <select className="input" style={{ padding:"5px 10px", height:34, width:"auto", maxWidth:220 }}
+            <Row label="Voice"
+              sub={langVoices.length
+                ? `${langVoices.length} voice${langVoices.length > 1 ? "s" : ""} available  ·  ⚡ local  🌐 network`
+                : "No voices found for this language — tap Test to trigger loading"}>
+              <select className="input" style={{ padding:"5px 8px", height:34, width:"auto", maxWidth:230 }}
                 value={s.ttsVoice}
                 onChange={e => set_("ttsVoice", e.target.value)}>
-                <option value="">Auto (best available)</option>
+                <option value="">Auto (best local first)</option>
                 {langVoices.map(v => (
                   <option key={v.name} value={v.name}>
-                    {v.name}{v.localService ? " ⚡" : " 🌐"}
+                    {v.localService ? "⚡" : "🌐"} {v.name}
                   </option>
                 ))}
               </select>
             </Row>
 
-            {s.ttsVoice === "" && langVoices.length > 0 && (
-              <div style={{ fontSize:12, color:"var(--muted)", paddingBottom:10, lineHeight:1.5 }}>
-                ⚡ = local (instant, offline) &nbsp;·&nbsp; 🌐 = network (higher quality, needs internet)
-              </div>
-            )}
-
-            <Row label="Speech Rate">
-              <div style={{ display:"flex", gap:10, alignItems:"center" }}>
-                <input type="range" min={0.5} max={2} step={0.1} value={s.ttsRate}
-                  onChange={e => set_("ttsRate", +e.target.value)} style={{ width:90 }} />
-                <span style={{ fontSize:13, fontWeight:700, color:"var(--primary)", width:36 }}>{s.ttsRate.toFixed(1)}x</span>
-              </div>
-            </Row>
-
-            <Row label="Pitch">
-              <div style={{ display:"flex", gap:10, alignItems:"center" }}>
-                <input type="range" min={0.5} max={2} step={0.1} value={s.ttsPitch}
-                  onChange={e => set_("ttsPitch", +e.target.value)} style={{ width:90 }} />
-                <span style={{ fontSize:13, fontWeight:700, color:"var(--primary)", width:36 }}>{s.ttsPitch.toFixed(1)}</span>
-              </div>
-            </Row>
+            <SliderRow label="Rate"   k="ttsRate"   min={0.5} max={2} step={0.05} fmt={v => `${v.toFixed(2)}×`} />
+            <SliderRow label="Pitch"  k="ttsPitch"  min={0.5} max={2} step={0.05} fmt={v => v.toFixed(2)} />
+            <SliderRow label="Volume" k="ttsVolume" min={0}   max={1} step={0.05} fmt={v => `${Math.round(v*100)}%`} />
 
             <Row label="Preview">
-              <button className="btn btn-ghost btn-sm" onClick={() =>
-                Speech.speak("Hello! This is a preview of the selected voice.", s.ttsLang, s.ttsRate, null, s.ttsVoice, s.ttsPitch)
-              }>🔊 Test Voice</button>
-            </Row>
-
-            <Row label="Repeat After Me" sub="Voice training on card back"><Tog k="repeatAfterMe" /></Row>
-            <Row label="Pronunciation Scoring"><Tog k="voiceScoring" /></Row>
-            <Row label="Accent Tolerance" sub={`${Math.round(s.accentTolerance*100)}% similarity required`}>
-              <div style={{ display:"flex", gap:10, alignItems:"center" }}>
-                <input type="range" min={0.5} max={1} step={0.05} value={s.accentTolerance}
-                  onChange={e => set_("accentTolerance", +e.target.value)} style={{ width:90 }} />
-                <span style={{ fontSize:13, fontWeight:700, color:"var(--primary)", width:48, textAlign:"right" }}>{Math.round(s.accentTolerance*100)}%</span>
+              <div style={{ display:"flex", gap:8 }}>
+                <button className="btn btn-ghost btn-sm"
+                  onClick={() => Speech.speak("This is a voice preview.", s.ttsLang, s.ttsRate, null, s.ttsVoice, s.ttsPitch, s.ttsVolume)}>
+                  🔊 Test
+                </button>
+                <button className="btn btn-ghost btn-sm" onClick={() => Speech.cancel()}>⏹ Stop</button>
               </div>
             </Row>
 
             {allVoices.length === 0 && (
-              <div style={{ padding:"12px 0", fontSize:13, color:"var(--accent)", lineHeight:1.6 }}>
-                ⚠️ No voices loaded yet. Tap <strong>Test Voice</strong> to trigger voice loading, then re-open this tab.
+              <div style={{ padding:"8px 0 2px", fontSize:12, color:"var(--accent)", lineHeight:1.6 }}>
+                ⚠️ No voices loaded yet. Tap <strong>Test</strong> to trigger browser voice loading, then revisit this tab.
               </div>
             )}
+
+            {/* ── Recognition ─────────────────────────── */}
+            <SubHead>Recognition (Microphone)</SubHead>
+            <Row label="Recognition Language"
+              sub="Language used when listening for your spoken answer. Empty = follow TTS language.">
+              <select className="input" style={{ padding:"5px 8px", height:34, width:"auto", maxWidth:230 }}
+                value={s.recogLang}
+                onChange={e => set_("recogLang", e.target.value)}>
+                <option value="">Follow TTS Language</option>
+                {ALL_LANGS.map(([v,l]) => <option key={v} value={v}>{l}</option>)}
+              </select>
+            </Row>
+            <Row label="Repeat After Me" sub="Voice training panel shown on card back"><Tog k="repeatAfterMe" /></Row>
+            <Row label="Pronunciation Scoring" sub="Score your pronunciation after repeating"><Tog k="voiceScoring" /></Row>
+            <SliderRow label="Accent Tolerance"
+              sub="Minimum similarity score to pass pronunciation check"
+              k="accentTolerance" min={0.3} max={1} step={0.05}
+              fmt={v => `${Math.round(v * 100)}%`} />
           </>);
         })()}
         {sec==="quiz" && (<>
