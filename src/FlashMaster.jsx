@@ -138,25 +138,45 @@ const GDrive = {
       this._tokenClientId = clientId;
     }
 
-    const doRequest = (prompt) => new Promise((resolve, reject) => {
-      this._tokenResolvers.push({ resolve, reject });
+    const doRequest = (prompt, timeoutMs = 90_000) => new Promise((resolve, reject) => {
+      // Safety timeout: GIS callback sometimes never fires on Android Chrome
+      // when FedCM intercepts the flow.  Without this, the promise hangs forever
+      // and the UI stays stuck on "Signing in…".
+      const timer = setTimeout(() => {
+        // Remove this resolver from the queue so the stale entry can't fire later
+        const idx = this._tokenResolvers.findIndex(r => r.resolve === wrappedResolve);
+        if (idx !== -1) this._tokenResolvers.splice(idx, 1);
+        reject(new Error("Google sign-in timed out — please try again"));
+      }, timeoutMs);
+      const wrappedResolve = (v) => { clearTimeout(timer); resolve(v); };
+      const wrappedReject  = (e) => { clearTimeout(timer); reject(e); };
+      this._tokenResolvers.push({ resolve: wrappedResolve, reject: wrappedReject });
       this._tokenClient.requestAccessToken({ prompt });
     });
 
     this._pendingToken = (async () => {
       try {
+        // Android Chrome uses FedCM for Google sign-in.  FedCM's prompt:"none"
+        // path can silently swallow the callback (no resolve, no reject), causing
+        // the promise to hang indefinitely and the UI to stay on the login screen.
+        // On Android Chrome we skip straight to "select_account" which reliably
+        // shows the account sheet and always fires the callback.
+        const ua = navigator.userAgent || "";
+        const isAndroidChrome = /android/i.test(ua) && /chrome/i.test(ua) && !/edg|opr|samsung/i.test(ua);
+
         if (!interactive) {
-          // Silent only — never shows a popup
-          return await doRequest("none");
+          // Silent only — never shows a popup; shorter timeout for background checks
+          return await doRequest("none", 30_000);
         }
-        // Two-stage interactive:
-        //  1. Try prompt:"none" first — succeeds silently when the browser
-        //     still holds a valid Google session (very common case).
-        //  2. Fall back to prompt:"select_account" — reliably shows the
-        //     account picker.  Avoids the loop caused by prompt:"" when
-        //     FedCM/third-party cookies are blocked (Safari/Firefox ETP).
+
+        if (isAndroidChrome) {
+          // Skip silent attempt on Android Chrome to avoid FedCM deadlock
+          return await doRequest("select_account");
+        }
+
+        // Desktop / non-Android: try silent first, fall back to account picker
         try {
-          return await doRequest("none");
+          return await doRequest("none", 15_000);
         } catch {
           return await doRequest("select_account");
         }
@@ -1351,6 +1371,50 @@ const Speech = {
   _speakSeq    : 0,
   _voices      : null,    // WebSpeech voice cache
   _puterAudio  : null,    // currently-playing puter HTMLAudioElement
+  _audioCtx    : null,    // shared AudioContext — keeps audio pipeline alive
+  _mediaNodes  : new WeakMap(), // HTMLAudioElement → MediaElementSourceNode
+
+  // ── AudioContext unlock ───────────────────────────────────
+  // Browsers suspend the AudioContext (and the whole audio pipeline) after a
+  // period with no user interaction.  audio.play() then resolves silently but
+  // produces no sound.  Playing audio from another tab/app wakes the pipeline,
+  // which is exactly the symptom reported.
+  //
+  // Fix: on every speak() call (which is always triggered by a user tap) we
+  // resume the shared AudioContext and play a 1-frame silent buffer through it.
+  // This "unlocks" the pipeline so the puter HTMLAudioElement plays immediately.
+  async _unlockAudioContext() {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!this._audioCtx || this._audioCtx.state === "closed") {
+        this._audioCtx = new AC();
+      }
+      const ctx = this._audioCtx;
+      // Resume if suspended (the common case after inactivity)
+      if (ctx.state === "suspended") await ctx.resume();
+      // Play a 1-frame silent buffer — this is the canonical browser unlock trick.
+      // It forces the browser to actually open the audio output device.
+      const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start(0);
+    } catch { /* AudioContext unavailable — proceed without unlock */ }
+  },
+
+  // Connect a puter HTMLAudioElement through the shared AudioContext so it
+  // benefits from the same unlock.  createMediaElementSource can only be called
+  // once per element, so we cache the node in a WeakMap.
+  _connectToAudioCtx(audioEl) {
+    try {
+      if (!this._audioCtx || this._audioCtx.state === "closed") return;
+      if (this._mediaNodes.has(audioEl)) return; // already connected
+      const node = this._audioCtx.createMediaElementSource(audioEl);
+      node.connect(this._audioCtx.destination);
+      this._mediaNodes.set(audioEl, node);
+    } catch { /* cross-origin or already connected — safe to ignore */ }
+  },
 
   // ── Puter TTS (primary path) ──────────────────────────────
   async _puterSpeak(text, onEnd, seq) {
@@ -1361,13 +1425,53 @@ const Speech = {
       const audio = await puter.ai.txt2speech(text);
       if (seq !== this._speakSeq) { try { audio.pause(); } catch {} return; }
       this._puterAudio = audio;
+      // Route through the shared AudioContext so the unlock in speak() applies.
+      this._connectToAudioCtx(audio);
       audio.onended = () => {
         if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); }
       };
       audio.onerror = () => {
         if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); }
       };
-      audio.play().catch(() => { if (seq === this._speakSeq) onEnd?.(); });
+
+      // Wait for enough data to be buffered before playing.
+      // This prevents the leading-word clipping caused by the audio element
+      // starting before the codec has decoded the first frame.
+      const startPlay = () => {
+        if (seq !== this._speakSeq) return;
+        // 80 ms pre-roll: browser needs a tiny moment after canplaythrough
+        // to hand audio to the output device without dropping the first frame.
+        setTimeout(() => {
+          if (seq !== this._speakSeq) return;
+          audio.play().catch(async () => {
+            // play() can reject after an audio-output device change.
+            // Re-request the TTS audio from puter and try once more.
+            if (seq !== this._speakSeq) return;
+            try {
+              const audio2 = await puter.ai.txt2speech(text);
+              if (seq !== this._speakSeq) { try { audio2.pause(); } catch {} return; }
+              this._puterAudio = audio2;
+              audio2.onended = () => { if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); } };
+              audio2.onerror = () => { if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); } };
+              audio2.play().catch(() => { if (seq === this._speakSeq) this._webSpeechSpeak(text, "en-US", 1, onEnd, seq); });
+            } catch {
+              if (seq === this._speakSeq) this._webSpeechSpeak(text, "en-US", 1, onEnd, seq);
+            }
+          });
+        }, 80);
+      };
+
+      if (audio.readyState >= 3 /* HAVE_FUTURE_DATA */) {
+        startPlay();
+      } else {
+        audio.addEventListener("canplaythrough", startPlay, { once: true });
+        // Safety: if canplaythrough never fires, play anyway after 2 s
+        setTimeout(() => {
+          if (seq !== this._speakSeq || audio.readyState >= 3) return;
+          audio.removeEventListener("canplaythrough", startPlay);
+          audio.play().catch(() => { if (seq === this._speakSeq) onEnd?.(); });
+        }, 2000);
+      }
     } catch (e) {
       console.warn("[FM] puter TTS error — falling back to WebSpeech:", e?.message || e);
       if (seq === this._speakSeq) this._webSpeechSpeak(text, "en-US", 1, onEnd, seq);
@@ -1408,6 +1512,9 @@ const Speech = {
 
   _webSpeechSpeak(text, lang, rate, onEnd, seq) {
     if (!window.speechSynthesis) { onEnd?.(); return; }
+    // Resume AudioContext here too — WebSpeech synthesis shares the same
+    // audio pipeline and suffers the same auto-suspend silent-failure.
+    this._unlockAudioContext();
     const synth = window.speechSynthesis;
     synth.cancel();
 
@@ -1425,6 +1532,21 @@ const Speech = {
       u.onend  = () => { if (seq === this._speakSeq) onEnd?.(); };
       u.onerror = e => { if (e?.error !== "interrupted" && seq === this._speakSeq) onEnd?.(); };
       synth.speak(u); synth.resume?.();
+
+      // Watchdog: speechSynthesis can get permanently stuck after an audio
+      // output device change (speaking=true but onend never fires).
+      // After an estimated timeout, force-cancel and invoke onEnd.
+      const wordCount = text.split(/\s+/).length;
+      const estimatedMs = Math.max(4000, wordCount * 600); // ~600 ms/word
+      const watchdog = window.setTimeout(() => {
+        if (seq !== this._speakSeq) return;
+        if (synth.speaking || synth.pending) {
+          synth.cancel();
+          onEnd?.();
+        }
+      }, estimatedMs + 2000);
+      u.onend = () => { clearTimeout(watchdog); if (seq === this._speakSeq) onEnd?.(); };
+      u.onerror = e => { clearTimeout(watchdog); if (e?.error !== "interrupted" && seq === this._speakSeq) onEnd?.(); };
     };
 
     const primeAndSpeak = () => {
@@ -1448,10 +1570,16 @@ const Speech = {
   _normalizeSpeakText(text) {
     const value = String(text || "").replace(/\s+/g, " ").trim();
     if (!value) return "";
-    return `${value},`;
+    // Leading comma inserts a short silence before the first word, preventing
+    // audio clipping at the very start of puter TTS playback.
+    return `, ${value},`;
   },
 
   speak(text, lang = "en-US", rate = 1, onEnd = null) {
+    // Unlock the browser audio pipeline on every user-triggered speak() call.
+    // This is the fix for "voice sometimes silent until another tab plays audio":
+    // the AudioContext auto-suspends after inactivity and play() resolves silently.
+    this._unlockAudioContext();
     const spokenText = this._normalizeSpeakText(text);
     if (!spokenText) { onEnd?.(); return; }
 
