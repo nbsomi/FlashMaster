@@ -1364,261 +1364,111 @@ function QuestionMedia({ question, maxHeight = 160, marginBottom = 10 }) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// §6  SPEECH ENGINE  — puter.js AI TTS (primary) + WebKit fallback
+// §6  SPEECH ENGINE  — WebSpeech API (SpeechSynthesis)
 // ══════════════════════════════════════════════════════════════
 const Speech = {
-  _speakTimer  : null,
-  _speakSeq    : 0,
-  _voices      : null,    // WebSpeech voice cache
-  _puterAudio  : null,    // currently-playing puter HTMLAudioElement
-  _audioCtx    : null,    // shared AudioContext — keeps audio pipeline alive
-  _mediaNodes  : new WeakMap(), // HTMLAudioElement → MediaElementSourceNode
+  _seq         : 0,       // cancellation token — incremented on every speak/cancel
+  _timer       : null,    // pending setTimeout handle
+  _voices      : null,    // cached voice list
+  _voiceReady  : false,   // true once onvoiceschanged has fired at least once
 
-  // ── AudioContext unlock ───────────────────────────────────
-  // Browsers suspend the AudioContext (and the whole audio pipeline) after a
-  // period with no user interaction.  audio.play() then resolves silently but
-  // produces no sound.  Playing audio from another tab/app wakes the pipeline,
-  // which is exactly the symptom reported.
-  //
-  // Fix: on every speak() call (which is always triggered by a user tap) we
-  // resume the shared AudioContext and play a 1-frame silent buffer through it.
-  // This "unlocks" the pipeline so the puter HTMLAudioElement plays immediately.
-  async _unlockAudioContext() {
-    try {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return;
-      if (!this._audioCtx || this._audioCtx.state === "closed") {
-        this._audioCtx = new AC();
-      }
-      const ctx = this._audioCtx;
-      // Resume if suspended (the common case after inactivity)
-      if (ctx.state === "suspended") await ctx.resume();
-      // Play a 1-frame silent buffer — this is the canonical browser unlock trick.
-      // It forces the browser to actually open the audio output device.
-      const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.connect(ctx.destination);
-      src.start(0);
-    } catch { /* AudioContext unavailable — proceed without unlock */ }
-  },
-
-  // Connect a puter HTMLAudioElement through the shared AudioContext so it
-  // benefits from the same unlock.  createMediaElementSource can only be called
-  // once per element, so we cache the node in a WeakMap.
-  _connectToAudioCtx(audioEl) {
-    try {
-      if (!this._audioCtx || this._audioCtx.state === "closed") return;
-      if (this._mediaNodes.has(audioEl)) return; // already connected
-      const node = this._audioCtx.createMediaElementSource(audioEl);
-      node.connect(this._audioCtx.destination);
-      this._mediaNodes.set(audioEl, node);
-    } catch { /* cross-origin or already connected — safe to ignore */ }
-  },
-
-  // ── Puter TTS (primary path) ──────────────────────────────
-  async _puterSpeak(text, onEnd, seq) {
-    try {
-      // puter.js may still be loading; wait for it
-      const puter = window.puter || await loadPuter();
-      if (seq !== this._speakSeq) return;
-      const audio = await puter.ai.txt2speech(text);
-      if (seq !== this._speakSeq) { try { audio.pause(); } catch {} return; }
-      this._puterAudio = audio;
-      // Route through the shared AudioContext so the unlock in speak() applies.
-      this._connectToAudioCtx(audio);
-      audio.onended = () => {
-        if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); }
-      };
-      audio.onerror = () => {
-        if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); }
-      };
-
-      // Wait for enough data to be buffered before playing.
-      // This prevents the leading-word clipping caused by the audio element
-      // starting before the codec has decoded the first frame.
-      const startPlay = () => {
-        if (seq !== this._speakSeq) return;
-        // 80 ms pre-roll: browser needs a tiny moment after canplaythrough
-        // to hand audio to the output device without dropping the first frame.
-        setTimeout(() => {
-          if (seq !== this._speakSeq) return;
-          audio.play().catch(async () => {
-            // play() can reject after an audio-output device change.
-            // Re-request the TTS audio from puter and try once more.
-            if (seq !== this._speakSeq) return;
-            try {
-              const audio2 = await puter.ai.txt2speech(text);
-              if (seq !== this._speakSeq) { try { audio2.pause(); } catch {} return; }
-              this._puterAudio = audio2;
-              audio2.onended = () => { if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); } };
-              audio2.onerror = () => { if (seq === this._speakSeq) { this._puterAudio = null; onEnd?.(); } };
-              audio2.play().catch(() => { if (seq === this._speakSeq) this._webSpeechSpeak(text, "en-US", 1, onEnd, seq); });
-            } catch {
-              if (seq === this._speakSeq) this._webSpeechSpeak(text, "en-US", 1, onEnd, seq);
-            }
-          });
-        }, 80);
-      };
-
-      if (audio.readyState >= 3 /* HAVE_FUTURE_DATA */) {
-        startPlay();
-      } else {
-        audio.addEventListener("canplaythrough", startPlay, { once: true });
-        // Safety: if canplaythrough never fires, play anyway after 2 s
-        setTimeout(() => {
-          if (seq !== this._speakSeq || audio.readyState >= 3) return;
-          audio.removeEventListener("canplaythrough", startPlay);
-          audio.play().catch(() => { if (seq === this._speakSeq) onEnd?.(); });
-        }, 2000);
-      }
-    } catch (e) {
-      console.warn("[FM] puter TTS error — falling back to WebSpeech:", e?.message || e);
-      if (seq === this._speakSeq) this._webSpeechSpeak(text, "en-US", 1, onEnd, seq);
-    }
-  },
-
-  // ── WebSpeech fallback ────────────────────────────────────
-  _ensureVoices() {
-    if (this._voices?.length) return;
-    if (!window.speechSynthesis?.getVoices) return;
+  // ── Voice list ────────────────────────────────────────────
+  // Returns all voices available from the browser.
+  // The list loads asynchronously on first call; this method caches it and
+  // sets up the onvoiceschanged listener so subsequent calls are instant.
+  getVoices() {
+    if (!window.speechSynthesis) return [];
+    if (this._voices) return this._voices;
     const list = window.speechSynthesis.getVoices();
-    if (list.length) { this._voices = list; return; }
-    if (!this._voiceListenerAttached) {
-      this._voiceListenerAttached = true;
+    if (list.length) { this._voices = list; return list; }
+    if (!this._voiceReady) {
+      this._voiceReady = true;
       window.speechSynthesis.onvoiceschanged = () => {
         this._voices = window.speechSynthesis.getVoices();
       };
     }
+    return [];
   },
 
-  _pickVoice(lang) {
-    this._ensureVoices();
-    const voices = this._voices || [];
-    if (!voices.length) return null;
-    const exact = voices.find(v => v.lang === lang);
-    if (exact) return exact;
-    const base = lang.split("-")[0]?.toLowerCase();
-    return voices.find(v => v.lang?.toLowerCase().startsWith(base)) || null;
+  // Returns voices that match a BCP-47 language tag (e.g. "en-US").
+  // Falls back to language-prefix match so "en-US" also finds "en-GB" voices
+  // on platforms with a limited voice set.
+  voicesForLang(lang) {
+    const all  = this.getVoices();
+    const exact = all.filter(v => v.lang === lang);
+    if (exact.length) return exact;
+    const base = lang.split("-")[0].toLowerCase();
+    return all.filter(v => v.lang?.toLowerCase().startsWith(base));
   },
 
-  _buildUtterance(text, lang, rate = 1, volume = 1) {
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = lang; u.rate = rate; u.volume = volume;
-    const voice = this._pickVoice(lang);
-    if (voice) u.voice = voice;
-    return u;
+  // Pick the best voice for a given lang + optional voiceName preference.
+  _pickVoice(lang, voiceName) {
+    const pool = this.voicesForLang(lang);
+    if (!pool.length) return null;
+    if (voiceName) {
+      const named = pool.find(v => v.name === voiceName);
+      if (named) return named;
+    }
+    // Prefer local (non-network) voices — they start instantly with no latency.
+    return pool.find(v => v.localService) || pool[0];
   },
 
-  _webSpeechSpeak(text, lang, rate, onEnd, seq) {
-    if (!window.speechSynthesis) { onEnd?.(); return; }
-    // Resume AudioContext here too — WebSpeech synthesis shares the same
-    // audio pipeline and suffers the same auto-suspend silent-failure.
-    this._unlockAudioContext();
-    const synth = window.speechSynthesis;
-    synth.cancel();
-
-    const queue = (fn, delay) => {
-      this._speakTimer = window.setTimeout(() => {
-        this._speakTimer = null;
-        if (seq !== this._speakSeq) return;
-        fn();
-      }, delay);
-    };
-
-    const speakMain = () => {
-      if (seq !== this._speakSeq) return;
-      const u = this._buildUtterance(text, lang, rate, 1);
-      u.onend  = () => { if (seq === this._speakSeq) onEnd?.(); };
-      u.onerror = e => { if (e?.error !== "interrupted" && seq === this._speakSeq) onEnd?.(); };
-      synth.speak(u); synth.resume?.();
-
-      // Watchdog: speechSynthesis can get permanently stuck after an audio
-      // output device change (speaking=true but onend never fires).
-      // After an estimated timeout, force-cancel and invoke onEnd.
-      const wordCount = text.split(/\s+/).length;
-      const estimatedMs = Math.max(4000, wordCount * 600); // ~600 ms/word
-      const watchdog = window.setTimeout(() => {
-        if (seq !== this._speakSeq) return;
-        if (synth.speaking || synth.pending) {
-          synth.cancel();
-          onEnd?.();
-        }
-      }, estimatedMs + 2000);
-      u.onend = () => { clearTimeout(watchdog); if (seq === this._speakSeq) onEnd?.(); };
-      u.onerror = e => { clearTimeout(watchdog); if (e?.error !== "interrupted" && seq === this._speakSeq) onEnd?.(); };
-    };
-
-    const primeAndSpeak = () => {
-      if (seq !== this._speakSeq) return;
-      let primerDone = false;
-      const afterPrimer = () => {
-        if (primerDone) return;
-        primerDone = true;
-        queue(speakMain, 200);
-      };
-      const primer = this._buildUtterance("a a", lang, 1, 0.01);
-      primer.onend = afterPrimer; primer.onerror = afterPrimer;
-      synth.speak(primer); synth.resume?.();
-      window.setTimeout(() => { if (seq === this._speakSeq) afterPrimer(); }, 1000);
-    };
-
-    queue(primeAndSpeak, 150);
-  },
-
-  // ── Public API ────────────────────────────────────────────
-  _normalizeSpeakText(text) {
+  // ── Core speak ────────────────────────────────────────────
+  // lang      — BCP-47 tag, e.g. "en-US"
+  // rate      — 0.5–2.0
+  // voiceName — exact voice name string from getVoices() (optional)
+  // pitch     — 0.5–2.0 (optional, default 1)
+  // volume    — 0–1     (optional, default 1)
+  speak(text, lang = "en-US", rate = 1, onEnd = null, voiceName = "", pitch = 1, volume = 1) {
     const value = String(text || "").replace(/\s+/g, " ").trim();
-    if (!value) return "";
-    // Leading comma inserts a short silence before the first word, preventing
-    // audio clipping at the very start of puter TTS playback.
-    return `, ${value},`;
-  },
+    if (!value) { onEnd?.(); return; }
+    if (!window.speechSynthesis) { onEnd?.(); return; }
 
-  speak(text, lang = "en-US", rate = 1, onEnd = null) {
-    // Unlock the browser audio pipeline on every user-triggered speak() call.
-    // This is the fix for "voice sometimes silent until another tab plays audio":
-    // the AudioContext auto-suspends after inactivity and play() resolves silently.
-    this._unlockAudioContext();
-    const spokenText = this._normalizeSpeakText(text);
-    if (!spokenText) { onEnd?.(); return; }
+    // Cancel anything already playing
+    this.cancel();
 
-    // Stop everything in-flight
-    if (this._speakTimer) { clearTimeout(this._speakTimer); this._speakTimer = null; }
-    this._speakSeq += 1;
-    const seq = this._speakSeq;
+    const seq   = ++this._seq;
+    const synth = window.speechSynthesis;
 
-    // Cancel any live puter audio
-    if (this._puterAudio) {
-      try { this._puterAudio.pause(); } catch {}
-      this._puterAudio = null;
-    }
-    window.speechSynthesis?.cancel();
+    const doSpeak = () => {
+      if (seq !== this._seq) return;
+      const u    = new SpeechSynthesisUtterance(value);
+      u.lang     = lang;
+      u.rate     = rate;
+      u.pitch    = pitch;
+      u.volume   = volume;
+      const voice = this._pickVoice(lang, voiceName);
+      if (voice) u.voice = voice;
 
-    // puter.js takes priority; WebSpeech is the fallback
-    if (window.puter?.ai?.txt2speech) {
-      this._puterSpeak(spokenText, onEnd, seq);
-    } else {
-      // Try to load puter.js, fall back immediately if unavailable
-      loadPuter()
-        .then(() => {
-          if (seq !== this._speakSeq) return;
-          this._puterSpeak(spokenText, onEnd, seq);
-        })
-        .catch(() => {
-          if (seq !== this._speakSeq) return;
-          this._webSpeechSpeak(spokenText, lang, rate, onEnd, seq);
-        });
-    }
+      // Watchdog — speechSynthesis.onend can silently never fire on some
+      // Android/Chrome builds.  Estimate duration and force-resolve.
+      const wordCount   = value.split(/\s+/).length;
+      const estimatedMs = Math.max(3000, (wordCount / rate) * 500);
+      const watchdog    = setTimeout(() => {
+        if (seq !== this._seq) return;
+        synth.cancel();
+        onEnd?.();
+      }, estimatedMs + 2500);
+
+      u.onend  = () => { clearTimeout(watchdog); if (seq === this._seq) onEnd?.(); };
+      u.onerror = e => {
+        clearTimeout(watchdog);
+        if (e?.error !== "interrupted" && seq === this._seq) onEnd?.();
+      };
+
+      synth.speak(u);
+      // Chrome desktop requires an explicit resume() if the page was idle
+      synth.resume?.();
+    };
+
+    // Small delay after cancel() lets Chrome flush its queue before the new
+    // utterance is enqueued — avoids the "speaks once then goes silent" bug.
+    this._timer = setTimeout(doSpeak, 120);
   },
 
   cancel() {
-    if (this._speakTimer) { clearTimeout(this._speakTimer); this._speakTimer = null; }
-    this._speakSeq += 1;
-    if (this._puterAudio) {
-      try { this._puterAudio.pause(); } catch {}
-      this._puterAudio = null;
-    }
+    if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+    this._seq++;
     window.speechSynthesis?.cancel();
   },
 
@@ -1772,7 +1622,7 @@ const DEFAULT_SETTINGS = {
   // General
   theme: "dark", fontSize: "medium", uiLang: "en", hapticFeedback: true, focusMode: false,
   // TTS / Voice
-  autoTTS: true, ttsLang: "en-US", ttsRate: 1.0,
+  autoTTS: true, ttsLang: "en-US", ttsRate: 1.0, ttsVoice: "", ttsPitch: 1.0,
   repeatAfterMe: false, voiceScoring: true, accentTolerance: 0.70,
   // Learning
   spacedRepetition: true, smartShuffle: true, repetitionCount: 3,
@@ -1868,8 +1718,7 @@ function AppProvider({ children }) {
     (async () => {
       try {
         const db = await getDB(); // triggers Dexie open + migration
-        // Pre-load puter.js in parallel so TTS is ready immediately
-        loadPuter().catch(() => {/* puter unavailable — WebSpeech will be used */});
+        // Pre-load voices so the list is ready by the time user opens Voice settings
         const [p, allSubjects, allTopics, allSubtopics, q, allProgress, allQA, lb, allRH] = await Promise.all([
           db.profiles.toArray(),
           db.subjects.toArray(),
@@ -2895,7 +2744,7 @@ function ClozeQuestion({ question, onAnswer, checked }) {
 /**
  * Universal QuestionRenderer — dispatches to correct component by type
  */
-function QuestionRenderer({ question, userAnswer, onAnswer, checked, reverseMode, ttsLang, ttsRate, showExplanation, showHint }) {
+function QuestionRenderer({ question, userAnswer, onAnswer, checked, reverseMode, ttsLang, ttsRate, ttsVoice, ttsPitch, showExplanation, showHint }) {
   const [text, setText] = useState("");
   const [listening, setListening] = useState(false);
   const { settings } = useApp();
@@ -2997,7 +2846,7 @@ function QuestionRenderer({ question, userAnswer, onAnswer, checked, reverseMode
   // FillBlank / Dictation / Image / Audio
   return (
     <div>
-      {effectiveType === "Dictation" && <button className="btn btn-accent" style={{ width:"100%", marginBottom:12, padding:16 }} onClick={() => Speech.speak(q.answer, ttsLang, ttsRate)}>🔊 Listen — type what you hear</button>}
+      {effectiveType === "Dictation" && <button className="btn btn-accent" style={{ width:"100%", marginBottom:12, padding:16 }} onClick={() => Speech.speak(q.answer, ttsLang, ttsRate, null, ttsVoice, ttsPitch)}>🔊 Listen — type what you hear</button>}
       {["Image","Audio"].includes(effectiveType) && <QuestionMedia question={q} />}
       {showHint && !checked && <div style={{ fontSize:13, color:"var(--accent)", fontWeight:700, marginBottom:8 }}>💡 Starts with: {q.answer[0]?.toUpperCase()}</div>}
       <div style={{ display:"flex", gap:8 }}>
@@ -3247,7 +3096,7 @@ function FlashScreen() {
   // TTS
   useEffect(() => {
     if (!studyCurrent || !settings.autoTTS || isDone) return;
-    const t = setTimeout(() => Speech.speak(reverseMode ? studyCurrent.answer : questionPrompt, settings.ttsLang, settings.ttsRate), 300);
+    const t = setTimeout(() => Speech.speak(reverseMode ? studyCurrent.answer : questionPrompt, settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch), 300);
     return () => { clearTimeout(t); Speech.cancel(); };
   }, [idx, reverseMode, rep, settings.autoTTS]);
 
@@ -3403,7 +3252,7 @@ function FlashScreen() {
                 <div>{reverseMode ? questionPrompt : studyCurrent.answer}</div>
               </div>
               <div style={{ display:"flex", gap:8, marginTop:12 }}>
-                <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); Speech.speak(reverseMode ? questionPrompt : studyCurrent.answer, settings.ttsLang, settings.ttsRate); }}>🔊</button>
+                <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); Speech.speak(reverseMode ? questionPrompt : studyCurrent.answer, settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch); }}>🔊</button>
                 {settings.repeatAfterMe && <button className="btn btn-ghost btn-sm" style={{ color:"var(--accent)" }} onClick={e => { e.stopPropagation(); setShowRepeat(r => !r); }}>🎙️</button>}
               </div>
               {showRepeat && settings.repeatAfterMe && (
@@ -3420,7 +3269,7 @@ function FlashScreen() {
       <div className="card">
         {!flipped && !checked && ["MCQ","TrueFalse","MultiSelect","Match","Order","Cloze","Dictation"].includes(studyCurrent.type) ? (
           <QuestionRenderer question={studyCurrent} userAnswer={userAnswer} onAnswer={a => { setUserAnswer(a); if (["MCQ","TrueFalse"].includes(studyCurrent.type)) setFlipped(true); }}
-            checked={false} reverseMode={reverseMode} ttsLang={settings.ttsLang} ttsRate={settings.ttsRate} showHint={showHint} showExplanation={false} />
+            checked={false} reverseMode={reverseMode} ttsLang={settings.ttsLang} ttsRate={settings.ttsRate} ttsVoice={settings.ttsVoice} ttsPitch={settings.ttsPitch} showHint={showHint} showExplanation={false} />
         ) : !flipped && !checked ? (
           <div>
             <div style={{ display:"flex", gap:8, marginBottom:10 }}>
@@ -3767,7 +3616,7 @@ function QuizScreen() {
   const current = qList[qi];
 
   useEffect(() => { setUa(""); setChk(false); setTL(settings.timerSec || 30); }, [qi]);
-  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak(getQuestionLabel(current), settings.ttsLang, settings.ttsRate); }, [qi, settings.autoTTS]);
+  useEffect(() => { if (!settings.autoTTS || !current || checked || done) return; Speech.speak(getQuestionLabel(current), settings.ttsLang, settings.ttsRate, null, settings.ttsVoice, settings.ttsPitch); }, [qi, settings.autoTTS]);
 
   useEffect(() => {
     if (!settings.timerSec || checked || done || !current) return;
@@ -3889,7 +3738,7 @@ function QuizScreen() {
           {nav.reverseMode ? `Answer: "${current.answer}"` : getQuestionLabel(current)}
         </div>
         <QuestionRenderer question={current} userAnswer={ua} onAnswer={setUa} checked={checked}
-          reverseMode={nav.reverseMode} ttsLang={settings.ttsLang} ttsRate={settings.ttsRate}
+          reverseMode={nav.reverseMode} ttsLang={settings.ttsLang} ttsRate={settings.ttsRate} ttsVoice={settings.ttsVoice} ttsPitch={settings.ttsPitch}
           showExplanation={settings.showExplanations} showHint={false} />
         {checked && (
           <div style={{ marginTop:14, padding:"12px 16px", borderRadius:10, background:curR?.correct?"#10B98115":"#EF444415", border:`1px solid ${curR?.correct?"var(--green)":"var(--red)"}40` }}>
@@ -4176,14 +4025,96 @@ function SettingsScreen() {
           <Row label="Show Forgetting Curve" sub="Retention % on flashcards"><Tog k="showForgettingCurve" /></Row>
           <Row label="Repetition Rounds"><Slide k="repetitionCount" min={1} max={6} /></Row>
         </>)}
-        {sec==="voice" && (<>
-          <Row label="Auto TTS" sub="Read questions aloud"><Tog k="autoTTS" /></Row>
-          <Row label="Repeat After Me" sub="Voice training on card back"><Tog k="repeatAfterMe" /></Row>
-          <Row label="Pronunciation Scoring"><Tog k="voiceScoring" /></Row>
-          <Row label="Accent Tolerance" sub={`${Math.round(s.accentTolerance*100)}% similarity required`}><Slide k="accentTolerance" min={0.5} max={1} step={0.05} fmt={v=>`${Math.round(v*100)}%`} /></Row>
-          <Row label="TTS Language"><Sel k="ttsLang" opts={[["en-US","🇺🇸 English"],["hi-IN","🇮🇳 Hindi"],["ta-IN","🇮🇳 Tamil"],["te-IN","🇮🇳 Telugu"],["fr-FR","🇫🇷 French"],["de-DE","🇩🇪 German"],["es-ES","🇪🇸 Spanish"],["zh-CN","🇨🇳 Chinese"],["ja-JP","🇯🇵 Japanese"]]} /></Row>
-          <Row label="Speech Rate"><Slide k="ttsRate" min={0.5} max={2} step={0.1} fmt={v=>`${v}x`} /></Row>
-        </>)}
+        {sec==="voice" && (()=>{
+          // Build the voice list reactively inside the settings render.
+          // We re-read on every render so newly-loaded voices appear without
+          // requiring a page reload (Chrome loads voices async).
+          const allVoices  = Speech.getVoices();
+          const langVoices = allVoices.filter(v => {
+            const base = s.ttsLang.split("-")[0].toLowerCase();
+            return v.lang === s.ttsLang || v.lang?.toLowerCase().startsWith(base);
+          });
+          // Group by language for the "All voices" selector
+          const langGroups = allVoices.reduce((acc, v) => {
+            const g = v.lang || "Unknown";
+            if (!acc[g]) acc[g] = [];
+            acc[g].push(v);
+            return acc;
+          }, {});
+
+          return (<>
+            <Row label="Auto TTS" sub="Read questions aloud automatically"><Tog k="autoTTS" /></Row>
+
+            <Row label="TTS Language">
+              <select className="input" style={{ padding:"5px 10px", height:34, width:"auto" }}
+                value={s.ttsLang}
+                onChange={e => { set_("ttsLang", e.target.value); set_("ttsVoice", ""); }}>
+                {[["en-US","🇺🇸 English (US)"],["en-GB","🇬🇧 English (UK)"],["hi-IN","🇮🇳 Hindi"],
+                  ["ta-IN","🇮🇳 Tamil"],["te-IN","🇮🇳 Telugu"],["fr-FR","🇫🇷 French"],
+                  ["de-DE","🇩🇪 German"],["es-ES","🇪🇸 Spanish"],["zh-CN","🇨🇳 Chinese"],
+                  ["ja-JP","🇯🇵 Japanese"],["ar-SA","🇸🇦 Arabic"],["ko-KR","🇰🇷 Korean"],
+                  ["pt-BR","🇧🇷 Portuguese"]].map(([v,l]) => <option key={v} value={v}>{l}</option>)}
+              </select>
+            </Row>
+
+            <Row label="Voice" sub={langVoices.length ? `${langVoices.length} voice${langVoices.length>1?"s":""} available` : "No voices found — browser may still be loading"}>
+              <select className="input" style={{ padding:"5px 10px", height:34, width:"auto", maxWidth:220 }}
+                value={s.ttsVoice}
+                onChange={e => set_("ttsVoice", e.target.value)}>
+                <option value="">Auto (best available)</option>
+                {langVoices.map(v => (
+                  <option key={v.name} value={v.name}>
+                    {v.name}{v.localService ? " ⚡" : " 🌐"}
+                  </option>
+                ))}
+              </select>
+            </Row>
+
+            {s.ttsVoice === "" && langVoices.length > 0 && (
+              <div style={{ fontSize:12, color:"var(--muted)", paddingBottom:10, lineHeight:1.5 }}>
+                ⚡ = local (instant, offline) &nbsp;·&nbsp; 🌐 = network (higher quality, needs internet)
+              </div>
+            )}
+
+            <Row label="Speech Rate">
+              <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                <input type="range" min={0.5} max={2} step={0.1} value={s.ttsRate}
+                  onChange={e => set_("ttsRate", +e.target.value)} style={{ width:90 }} />
+                <span style={{ fontSize:13, fontWeight:700, color:"var(--primary)", width:36 }}>{s.ttsRate.toFixed(1)}x</span>
+              </div>
+            </Row>
+
+            <Row label="Pitch">
+              <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                <input type="range" min={0.5} max={2} step={0.1} value={s.ttsPitch}
+                  onChange={e => set_("ttsPitch", +e.target.value)} style={{ width:90 }} />
+                <span style={{ fontSize:13, fontWeight:700, color:"var(--primary)", width:36 }}>{s.ttsPitch.toFixed(1)}</span>
+              </div>
+            </Row>
+
+            <Row label="Preview">
+              <button className="btn btn-ghost btn-sm" onClick={() =>
+                Speech.speak("Hello! This is a preview of the selected voice.", s.ttsLang, s.ttsRate, null, s.ttsVoice, s.ttsPitch)
+              }>🔊 Test Voice</button>
+            </Row>
+
+            <Row label="Repeat After Me" sub="Voice training on card back"><Tog k="repeatAfterMe" /></Row>
+            <Row label="Pronunciation Scoring"><Tog k="voiceScoring" /></Row>
+            <Row label="Accent Tolerance" sub={`${Math.round(s.accentTolerance*100)}% similarity required`}>
+              <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                <input type="range" min={0.5} max={1} step={0.05} value={s.accentTolerance}
+                  onChange={e => set_("accentTolerance", +e.target.value)} style={{ width:90 }} />
+                <span style={{ fontSize:13, fontWeight:700, color:"var(--primary)", width:48, textAlign:"right" }}>{Math.round(s.accentTolerance*100)}%</span>
+              </div>
+            </Row>
+
+            {allVoices.length === 0 && (
+              <div style={{ padding:"12px 0", fontSize:13, color:"var(--accent)", lineHeight:1.6 }}>
+                ⚠️ No voices loaded yet. Tap <strong>Test Voice</strong> to trigger voice loading, then re-open this tab.
+              </div>
+            )}
+          </>);
+        })()}
         {sec==="quiz" && (<>
           <Row label="Adaptive Difficulty" sub="Weight questions by weakness"><Tog k="adaptiveQuiz" /></Row>
           <Row label="Show Explanations"><Tog k="showExplanations" /></Row>
